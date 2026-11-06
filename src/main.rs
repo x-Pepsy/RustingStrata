@@ -769,10 +769,17 @@ impl Serving {
     fn serve_parallel(&self, l: &mut Loaded, e: &Engine) -> Option<(PathBuf, TcpStream)> {
         let mut jobs: Vec<ChatJob> = Vec::new();
         let mut pending: VecDeque<(TcpStream, anyhow::Result<serve::Request>, usize)> = VecDeque::new();
+        // Which reply's state is in the model now: the scheduler only copies state when the reply changes.
+        let mut active: Option<usize> = None;
         loop {
             // Fill free slots from the queue first.
             while jobs.len() < e.parallel {
                 let Some((c, q, i)) = pending.pop_front() else { break };
+                if let Some(a) = active.take() {
+                    if let Some(p) = jobs.iter_mut().find(|x| x.i == a) {
+                        if let Err(err) = p.park(&mut *l) { eprintln!("request {a}: {err:#}"); }
+                    }
+                }
                 match ChatJob::start(c, q, &mut *l, e, self, i) {
                     Ok(Some(j)) => jobs.push(j),
                     Ok(None) => {}
@@ -791,6 +798,11 @@ impl Serving {
                 };
                 if is_chat {
                     if jobs.len() < e.parallel {
+                        if let Some(a) = active.take() {
+                            if let Some(p) = jobs.iter_mut().find(|x| x.i == a) {
+                                if let Err(err) = p.park(&mut *l) { eprintln!("request {a}: {err:#}"); }
+                            }
+                        }
                         match ChatJob::start(c, q, &mut *l, e, self, i) {
                             Ok(Some(j)) => jobs.push(j),
                             Ok(None) => {}
@@ -805,6 +817,11 @@ impl Serving {
                         let mut c = c;
                         let _ = reply(&mut c, "409 Conflict", json!({"error": {"message": "replies are running; load the model when they finish", "type": "conflict"}}));
                     } else {
+                        if let Some(a) = active.take() {
+                            if let Some(p) = jobs.iter_mut().find(|x| x.i == a) {
+                                if let Err(err) = p.park(&mut *l) { eprintln!("request {a}: {err:#}"); }
+                            }
+                        }
                         let mut next = None;
                         if let Err(err) = handle(c, q, Some(&mut *l), e, self, i, &mut next) { eprintln!("request {i}: {err:#}"); }
                         if let Some(n) = next { return Some(n); }
@@ -813,8 +830,30 @@ impl Serving {
                 self.waiting.fetch_sub(1, Relaxed);
             }
             if jobs.is_empty() { continue; }
-            for j in jobs.iter_mut() {
-                if let Err(err) = j.quantum(&mut *l, self, PAR_QUANTUM) { eprintln!("request {}: {err:#}", j.i); j.done = true; }
+            for k in 0..jobs.len() {
+                if jobs[k].done { continue; }
+                if active != Some(jobs[k].i) {
+                    if let Some(a) = active.take() {
+                        if let Some(p) = jobs.iter_mut().find(|x| x.i == a) {
+                            if let Err(err) = p.park(&mut *l) { eprintln!("request {a}: {err:#}"); }
+                        }
+                    }
+                    if let Err(err) = jobs[k].adopt(&mut *l) {
+                        eprintln!("request {}: {err:#}", jobs[k].i);
+                        jobs[k].done = true;
+                        active = None;
+                        continue;
+                    }
+                    active = Some(jobs[k].i);
+                }
+                if let Err(err) = jobs[k].quantum(&mut *l, self, PAR_QUANTUM) {
+                    eprintln!("request {}: {err:#}", jobs[k].i);
+                    jobs[k].done = true;
+                }
+                if jobs[k].done && active == Some(jobs[k].i) {
+                    let _ = jobs[k].park(&mut *l);
+                    active = None;
+                }
             }
             jobs.retain(|j| !j.done);
             {
@@ -1218,12 +1257,12 @@ impl ChatJob {
             name, prompt_tokens, cached, n_system, t0, t1, stop: false, done: false }))
     }
 
-    /// Generate up to `q` tokens for this reply, then park its state for the next one.
+    /// Generate up to `q` tokens for this reply. The caller leaves this reply's state in the model (see `adopt` and
+    /// `park`), so consecutive quanta of the same reply have no state copies at all.
     fn quantum(&mut self, l: &mut Loaded, s: &Serving, q: usize) -> anyhow::Result<()> {
         if self.done { return Ok(()); }
         let Loaded { r, tok, tpl, name, .. } = l;
         let Runner::Gpu(g) = r else { anyhow::bail!("parallel replies need one unsplit GPU model") };
-        g.adopt(&self.ids)?;
         let mut emitted = 0;
         for _ in 0..q {
             if self.out.len() >= self.n { self.done = true; break; }
@@ -1250,7 +1289,6 @@ impl ChatJob {
                 if self.hold.stopped { self.stop = true; self.done = true; break; }
             }
         }
-        g.park_current(&self.ids)?;
         if emitted > 0 { s.stats.lock().unwrap().live_tokens += emitted; }
         if self.req.stream && !self.text.is_empty() {
             let text = std::mem::take(&mut self.text);
@@ -1262,6 +1300,18 @@ impl ChatJob {
             }
         }
         if self.done { self.finish(tpl, name, s)?; }
+        Ok(())
+    }
+
+    /// Put this reply's parked state back in the model.
+    fn adopt(&mut self, l: &mut Loaded) -> anyhow::Result<()> {
+        if let Runner::Gpu(g) = &mut l.r { g.adopt(&self.ids)?; }
+        Ok(())
+    }
+
+    /// Move this reply's state out of the model, so another one can use it.
+    fn park(&mut self, l: &mut Loaded) -> anyhow::Result<()> {
+        if let Runner::Gpu(g) = &mut l.r { g.park_current(&self.ids)?; }
         Ok(())
     }
 
