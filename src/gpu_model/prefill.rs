@@ -81,10 +81,13 @@ impl GpuModel<'_> {
         anyhow::ensure!(self.pos + tokens.len() <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
         for ch in tokens.chunks(chunk) { self.prefill_chunk(ch, None)?; }
         // The prompt's routing predicts the reply's: place its hot experts now instead of 64 per adapt during decode.
+        // Capped: a swap is a VRAM upload, and letting the pass free-run cost seconds before the first token when
+        // the prompt changed topic (a 7.9 s first reply after loading). The decode loop keeps adapting every 8 tokens.
         let adapt = self.adapt_every > 0;
+        let swaps = (tokens.len() / 4).clamp(64, 256);
         let mut p = Some(&mut *self);
         while let Some(q) = p {
-            if adapt && let Some(cache) = q.cache.as_mut() { cache.adapt(q.m, &*q.gpu, usize::MAX)?; }
+            if adapt && let Some(cache) = q.cache.as_mut() { cache.adapt(q.m, &*q.gpu, swaps)?; }
             p = q.next.as_deref_mut();
         }
         let s = self.tail();

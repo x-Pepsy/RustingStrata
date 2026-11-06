@@ -965,7 +965,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // The chat page holds no secret, so it loads without the key (the page asks for it).
     if method == "GET" && path == "/" {
         const PAGE: &str = include_str!("web/index.html");
-        return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
+        return Ok(write!(w, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{PAGE}", PAGE.len())?);
     }
     if s.key.as_deref().is_some_and(|k| !serve::key_ok(&auth, k)) { return send(&mut w, "401 Unauthorized", json!({"error": {"message": "missing or wrong API key", "type": "invalid_api_key"}})); }
     if method == "POST" && !json { return send(&mut w, "415 Unsupported Media Type", json!({"error": {"message": "Content-Type must be application/json", "type": "invalid_request_error"}})); }
@@ -1058,7 +1058,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                             "content": [], "stop_reason": null, "stop_sequence": null,
                             "usage": {"input_tokens": ids.len() - cached, "cache_read_input_tokens": cached, "output_tokens": 0}}}))?;
                     } else {
-                        write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
+                        write!(w, "data: {}\n\n", chunk(json!({"role": "assistant"}), None))?;
                     }
                 }
                 // The think block goes out as `reasoning_content`, the answer as `content` (the Messages API
@@ -1277,7 +1277,7 @@ impl ChatJob {
                         "content": [], "stop_reason": null, "stop_sequence": null,
                         "usage": {"input_tokens": ids.len() - reused, "cache_read_input_tokens": reused, "output_tokens": 0}}}))?;
                 } else {
-                    write!(w, "data: {}\n\n", chunk_json(&id, created, &name, json!({"role": "assistant", "content": ""}), None))?;
+                    write!(w, "data: {}\n\n", chunk_json(&id, created, &name, json!({"role": "assistant"}), None))?;
                 }
             }
             if let Runner::Gpu(g) = r {

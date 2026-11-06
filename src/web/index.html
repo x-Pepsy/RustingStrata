@@ -469,7 +469,7 @@ async function reply() {
   busy = new AbortController();
   $('send').textContent = 'Stop';
   const thinking = $('think').checked;
-  let text = '', usage = null, t1 = 0, n = 0, err = null;
+  let text = '', thinkText = '', usage = null, t1 = 0, n = 0, err = null;
   const t0 = performance.now();
   try {
     const r = await fetch('/v1/chat/completions', { method: 'POST', headers: headers(), signal: busy.signal, body: JSON.stringify({
@@ -491,11 +491,17 @@ async function reply() {
         if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
         const j = JSON.parse(line.slice(6));
         if (j.usage) usage = j.usage;
-        const c = j.choices?.[0]?.delta?.content;
-        if (!c) continue;
+        // The reply comes as `reasoning_content` (think block) plus `content` (answer). Older servers put both in
+        // `content` with the tags, which `split` still handles when no reasoning field arrives.
+        const d = j.choices?.[0]?.delta || {};
+        const rc = d.reasoning_content, c = d.content;
+        if (!rc && !c) continue;
         if (!t1) t1 = performance.now();
-        text += c; n++;
-        [m.think, m.content] = split(text, thinking);
+        if (rc) thinkText += rc;
+        if (c) text += c;
+        n++;
+        if (thinkText) { m.think = thinkText; m.content = text; }
+        else [m.think, m.content] = split(text, thinking);
         if (chat === cur && b.isConnected) {
           body(b, m, true);
           const s = (performance.now() - t1) / 1000;
@@ -512,7 +518,8 @@ async function reply() {
     m.error = true;
     m.content = err === 'no model loaded' ? 'No model is loaded. Pick one in the list at the top.' : err === 'Failed to fetch' ? 'The server is not reachable. Is strata still running?' : 'The server answered: ' + err;
   } else {
-    [m.think, m.content] = split(text, thinking);
+    if (thinkText) { m.think = thinkText; m.content = text; }
+    else [m.think, m.content] = split(text, thinking);
     if (usage && t1) {
       const gen = (performance.now() - t1) / 1000, k = usage.completion_tokens;
       m.meta = [`${k} tokens`, `${(k > 1 ? (k - 1) / gen : 0).toFixed(1)} tokens/s`, `first word after ${secs((t1 - t0) / 1000)}`];
