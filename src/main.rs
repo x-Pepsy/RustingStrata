@@ -35,10 +35,11 @@ struct Engine {
     /// VRAM left free after placing expert layers, in MB.
     #[arg(long, default_value_t = 512)]
     vram_margin: usize,
-    /// Speculative decoding with the model's MTP draft head, N drafts per step (GPU; greedy output unchanged, sampling keeps its distribution)
+    /// Speculative decoding with the model's MTP draft head: N drafts per step, or `auto` to pick the depth each
+    /// step from the acceptance measured so far (GPU; greedy output unchanged, sampling keeps its distribution)
     /// [default: calibrated, else 0].
-    #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
-    mtp: Option<usize>,
+    #[arg(long, value_name = "N|auto", default_missing_value = "1", num_args = 0..=1)]
+    mtp: Option<String>,
     /// Sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 0.0)]
     temp: f32,
@@ -141,7 +142,11 @@ impl Runner<'_> {
         if let Runner::Gpu(g) = self {
             let sum = |f: &dyn Fn(&GpuModel) -> usize| g.parts().map(f).sum::<usize>();
             let (hits, misses) = (sum(&|p| p.hits), sum(&|p| p.misses));
-            if g.drafts.0 > 0 { eprintln!("MTP drafts accepted {}/{} ({:.1}%)", g.drafts.1, g.drafts.0, 100.0 * g.drafts.1 as f64 / g.drafts.0 as f64); }
+            if g.drafts.0 > 0 {
+                let depth = if g.mtp_auto { format!(", mean depth {:.2} of {}", g.mtp_depth(), g.k) } else { String::new() };
+                eprintln!("MTP drafts accepted {}/{} ({:.1}%){}", g.drafts.1, g.drafts.0,
+                          100.0 * g.drafts.1 as f64 / g.drafts.0 as f64, depth);
+            }
             eprintln!("expert hit rate {:.1}% ({} misses), cache swaps {}", 100.0 * hits as f64 / (hits + misses).max(1) as f64, misses,
                 sum(&|p| p.cache.as_ref().map_or(0, |c| c.swaps)));
             let resumed = sum(&|p| p.resumed.get());
@@ -167,7 +172,7 @@ impl Engine {
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
-        self.mtp.get_or_insert(get("mtp").unwrap_or(0));
+        self.mtp.get_or_insert_with(|| get("mtp").unwrap_or(0).to_string());
         self.short = get("short").unwrap_or(32);
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
@@ -175,14 +180,22 @@ impl Engine {
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         // A parked sequence does not carry the MTP draft state, so concurrent replies decode without it.
         if self.parallel > 1 {
-            if self.mtp() > 0 { eprintln!("--parallel > 1: MTP is off while replies take turns"); }
-            self.mtp = Some(0);
-        }        let mut g = GpuModel::load_split_with(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp(), self.kv_start()).context(LOAD_HINT)?;
+            if self.spec() { eprintln!("--parallel > 1: MTP is off while replies take turns"); }
+            self.mtp = Some("0".into());
+        }
+        // `auto` sizes the buffers for the deepest draft it may use; the controller then chooses 1..=that per step.
+        let mk = if self.mtp_auto() { rusting_strata::cpu_worker::TMAX - 1 } else { self.mtp() };
+        let mut g = GpuModel::load_split_with(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, mk, self.kv_start()).context(LOAD_HINT)?;
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
-        if self.mtp() > 0 && g.k == 0 {
+        g.mtp_auto = self.mtp_auto();
+        // The verify kernels take at most `TMAX` tokens per forward, so at most TMAX - 1 drafts are possible.
+        if self.mtp() > g.k {
+            eprintln!("--mtp {}: at most {} drafts here (the verify kernels take {} tokens per forward)", self.mtp(), g.k, g.k + 1);
+        }
+        if self.spec() && g.k == 0 {
             eprintln!("--mtp: this model has no MTP draft head (or it is split over GPUs), decoding without it");
-            self.mtp = Some(0);
+            self.mtp = Some("0".into());
         }
         Ok(Runner::Gpu(Box::new(g)))
     }
@@ -190,7 +203,11 @@ impl Engine {
         Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed) }
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
-    fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+    fn mtp(&self) -> usize { self.mtp.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0) }
+    /// `--mtp auto`: the draft depth is chosen per step from the measured acceptance.
+    fn mtp_auto(&self) -> bool { self.mtp.as_deref() == Some("auto") }
+    /// Whether decoding goes through `spec_step`.
+    fn spec(&self) -> bool { self.mtp_auto() || self.mtp() > 0 }
     /// KV tokens to allocate at load: `--ctx-start`, or all of `--ctx` when it is 0.
     fn kv_start(&self) -> usize { if self.ctx_start == 0 { self.ctx } else { self.ctx_start.min(self.ctx).max(1) } }
 }
@@ -429,7 +446,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let t1 = Instant::now();
             let (cpu0, split0) = (r.cpu_secs(), r.split_secs());
             let cap = room(&engine, ids.len(), n);
-            let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+            let (out, _) = decode(&mut r, &tok, engine.spec(), &mut engine.sampler(), logits, cap, &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
             let (pp, tg) = ((t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
             if out.len() == cap && cap < n { eprint!("\n(stopped: the context is full at {} tokens; raise --ctx)", engine.ctx); }
             eprintln!("\nprompt {} tok {:.2} tok/s | gen {} tok {:.2} tok/s", ids.len(), ids.len() as f64 / pp, out.len(), out.len() as f64 / tg);
@@ -491,7 +508,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     let l = r.prefill(&ids)?;
                     p.push(n as f64 / t.elapsed().as_secs_f64());
                     let t = Instant::now();
-                    let k = decode(&mut r, &tok, engine.mtp() > 0, &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
+                    let k = decode(&mut r, &tok, engine.spec(), &mut Sampler::greedy(), l, tg, &mut |_| Ok(false))?.0.len();
                     d.push(k as f64 / t.elapsed().as_secs_f64());
                 }
                 let stat = |v: &[f64]| {
@@ -523,7 +540,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
                 let (ids, logits, _) = r.chat(&tok, &tpl.render(&msgs, &[], think, engine.preserve_thinking, true), &tpl.render(&msgs, &[], think, engine.preserve_thinking, false), "")?;
-                let (out, _) = decode(&mut r, &tok, engine.mtp() > 0, &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
+                let (out, _) = decode(&mut r, &tok, engine.spec(), &mut smp, logits, room(&engine, ids.len(), n), &mut |t| { print!("{t}"); std::io::stdout().flush()?; Ok(false) })?;
                 println!();
                 msgs.push(Msg::new("assistant", &answer(&tok.decode(&out)?)));
             }
@@ -915,6 +932,7 @@ fn gpu_stats(r: &Runner, s: &mut serve::Stats) {
         s.vram = g.gpu.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64));
         s.experts = g.cache.as_ref().map(|_| (g.hits as u64, g.misses as u64));
         s.drafts = (g.drafts.0 > 0).then_some((g.drafts.0 as u64, g.drafts.1 as u64));
+        s.mtp_k = (g.mtp_auto && g.drafts.0 > 0).then(|| g.mtp_depth());
         s.kv_cap = g.kv_cap;
     }
 }
@@ -1065,7 +1083,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 // The think block goes out as `reasoning_content`, the answer as `content` (the Messages API
                 // stream here still starts the text block with the answer only).
                 let mut think = Think::new(req.think);
-                let r = decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
+                let r = decode(r, tok, e.spec(), &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     let t = hold.push(t);
                     if !t.is_empty() {

@@ -13,6 +13,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
+/// `--mtp auto`: weight of the new sample in the per-depth acceptance (a window of about 20 speculative steps, so a
+/// change of topic is followed), and the acceptance below which a further draft no longer pays for its verify row.
+const MTP_DECAY: f32 = 0.95;
+const MTP_MIN: f32 = 0.5;
+
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
 /// tokens fall on one side of ATT_GQA_MIN, i32::MAX (one head per block) or 0 (GQA) gives the same result and lets the
 /// backend launch only the kernel that works.
@@ -151,6 +156,14 @@ pub struct GpuModel<'a> {
     pub split_time: (Duration, Duration),
     /// MTP drafts per speculative step (0 = no draft head). May be lowered after `load`, never raised.
     pub k: usize,
+    /// `--mtp auto`: the depth used is chosen per step from the acceptance measured so far, up to `k`.
+    pub mtp_auto: bool,
+    /// Per depth 1..=k: drafts accepted and drafts tried, decayed each step so a change of topic is followed.
+    mtp_acc: Vec<[f32; 2]>,
+    /// Speculative steps taken, to schedule the exploration ones.
+    mtp_steps: u64,
+    /// Sum of the depths used, and the steps, for the side panel.
+    mtp_k_sum: u64,
     /// Prompts shorter than this go through `step` instead of the batched prefill.
     pub short: usize,
     /// Prefill scratch (None: prompts go through `step`).
@@ -362,7 +375,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, kv_cap, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, kv_cap, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, mtp_auto: false, mtp_acc: vec![[0.0; 2]; k + 1], mtp_steps: 0, mtp_k_sum: 0, short: 32, pf, mtp, first: range.start, next: None })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -793,6 +806,28 @@ impl<'a> GpuModel<'a> {
         Ok(self.gpu.get::<f32>(&self.logits, 0, self.m.cfg.n_vocab)?)
     }
 
+    /// Draft depth for this step (`--mtp auto`), else the loaded `k`. Each extra draft is one more verify row, so a
+    /// depth pays while the drafts at that depth are still accepted more often than not: the depth is the deepest
+    /// one whose acceptance is at least `MTP_MIN`, and a depth not tried yet counts as even (so the controller starts
+    /// at full depth and comes down, rather than sitting at depth 1 and never measuring the rest). Every 16th step
+    /// runs at full depth, so a depth that improved after the controller stopped using it is measured again.
+    fn pick_k(&self) -> usize {
+        if !self.mtp_auto || self.k <= 1 { return self.k; }
+        if self.mtp_steps % 16 == 0 { return self.k; }
+        let mut k = 1;
+        for d in 2..=self.k {
+            let [a, t] = self.mtp_acc[d];
+            if (a + 0.5) / (t + 1.0) < MTP_MIN { break; }
+            k = d;
+        }
+        k
+    }
+
+    /// Mean draft depth of the speculative steps so far (0 when none ran).
+    pub fn mtp_depth(&self) -> f32 {
+        if self.mtp_steps == 0 { 0.0 } else { self.mtp_k_sum as f32 / self.mtp_steps as f32 }
+    }
+
     /// Speculative decode with MTP. `t` is the next token (picked from the last logits), predicted by hidden row `row`.
     /// Drafts `k` tokens after `t` (each the draft head's argmax after the previous one), verifies [t, drafts..] in one
     /// forward and keeps the drafts up to the first one the main model rejects (`rollback`). Returns the accepted
@@ -801,7 +836,7 @@ impl<'a> GpuModel<'a> {
     /// kept with its probability (`Sampler::accept`), so tokens have the distribution of plain sampling. The draft head entries of accepted drafts wait for the next call's first draft pass,
     /// which runs them with `t` in one batch (their main model rows 0..n precede `t`'s row n).
     pub fn spec_step(&mut self, t: u32, row: usize, smp: &mut Sampler) -> anyhow::Result<(Vec<u32>, u32, usize)> {
-        let k = self.k;
+        let k = self.pick_k();
         if self.pos + k + 1 > self.ctx { return Ok((vec![t], smp.pick(&self.step(t)?)? as u32, 0)); }
         let h = self.mtp.as_mut().unwrap();
         let mut first = std::mem::take(&mut h.pend);
@@ -827,6 +862,13 @@ impl<'a> GpuModel<'a> {
                 match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
             }
         };
+        self.mtp_steps += 1;
+        self.mtp_k_sum += k as u64;
+        for d in 1..=k {
+            let a = &mut self.mtp_acc[d];
+            a[0] = a[0] * MTP_DECAY + if d <= n { 1.0 } else { 0.0 };
+            a[1] = a[1] * MTP_DECAY + 1.0;
+        }
         self.drafts.0 += k;
         self.drafts.1 += n;
         if n < k { self.rollback(start, n + 1)?; }
