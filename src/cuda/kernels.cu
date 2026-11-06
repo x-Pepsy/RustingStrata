@@ -1501,16 +1501,43 @@ extern "C" __global__ void ple_conv(float* r, const float* gated, const float* n
 
 // ---- attention ----
 
-// KV cache rows (one per position and KV head) hold hd f16 values, or with KV_Q8 (`--kv q8`) hd int8 values followed
-// by hd / 32 f16 scales, quantized like ggml's q8_0 (d = amax / 127 per 32 values). Offsets below count values.
-#if KV_Q8
-// Quantize x into the cache at value offset e; the 32 lanes of the warp hold one 32-value block.
+// KV cache rows (one per position and KV head) hold hd f16 values, or hd values packed at KV_BITS bits each followed by
+// one f16 scale per 32 values (`--kv q8`, `q4`, `q2`). Offsets below count values. The 32 lanes of a warp always hold
+// one whole 32-value block, so the scale is one warp reduction and the packing is a few shuffles.
+#if KV_BITS == 8
+// q8_0: d = amax / 127 per 32 values, one signed byte each, like ggml.
 __device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
     float d = warp_max(fabsf(x)) / 127.0f;
     int w = e % hd;
     char* r = (char*)c + e / hd * (hd + hd / 16);
     r[w] = (signed char)(d == 0.0f ? 0.0f : roundf(x / d));
     if ((w & 31) == 0) *(u16*)(r + hd + 2 * (w / 32)) = f2h(d);
+}
+#elif KV_BITS == 4
+// d = amax / 7, q in -7..7 stored biased by 8 as 4 bits; two values share a byte (low nibble first).
+__device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
+    float d = warp_max(fabsf(x)) / 7.0f;
+    int w = e % hd;
+    char* r = (char*)c + e / hd * (hd * 9 / 16);
+    int q = d == 0.0f ? 0 : (int)roundf(x / d);
+    unsigned u = (unsigned)((q < -7 ? -7 : (q > 7 ? 7 : q)) + 8);
+    u |= __shfl_down_sync(0xffffffffu, u, 1) << 4;
+    if ((w & 1) == 0) r[w >> 1] = (char)u;
+    if ((w & 31) == 0) *(u16*)(r + (hd >> 1) + 2 * (w >> 5)) = f2h(d);
+}
+#elif KV_BITS == 2
+// Four levels at -3d, -d, d, 3d with d = amax / 3: two bits each, four values per byte, nearest level.
+__device__ __forceinline__ void kv_put(u16* c, size_t e, int hd, float x) {
+    float d = warp_max(fabsf(x)) / 3.0f;
+    int w = e % hd;
+    char* r = (char*)c + e / hd * (hd * 5 / 16);
+    int q = d == 0.0f ? 0 : (int)roundf((x / d + 3.0f) * 0.5f);
+    unsigned u = (unsigned)(q < 0 ? 0 : (q > 3 ? 3 : q));
+    unsigned u1 = __shfl_down_sync(0xffffffffu, u, 1), u2 = __shfl_down_sync(0xffffffffu, u, 2),
+             u3 = __shfl_down_sync(0xffffffffu, u, 3);
+    u |= (u1 << 2) | (u2 << 4) | (u3 << 6);
+    if ((w & 3) == 0) r[w >> 2] = (char)u;
+    if ((w & 31) == 0) *(u16*)(r + (hd >> 2) + 2 * (w >> 5)) = f2h(d);
 }
 #else
 __device__ __forceinline__ void kv_put(u16* c, size_t e, int, float x) { c[e] = f2h(x); }
@@ -1570,7 +1597,7 @@ template <int PER> __device__ __forceinline__ void ldh_raw(const u16* p, unsigne
 }
 // PER consecutive cache values from value offset off (off a multiple of PER, PER <= 32) as f16 words, like ldh_raw.
 template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off, int hd, unsigned* o) {
-#if KV_Q8
+#if KV_BITS == 8
     int w = off % hd;
     const char* r = (const char*)c + off / hd * (hd + hd / 16);
     unsigned d = *(const u16*)(r + hd + 2 * (w / 32)) * 0x10001u;  // scale in both halves
@@ -1594,6 +1621,26 @@ template <int PER> __device__ __forceinline__ void ldkv(const u16* c, size_t off
         }
     } else {
         for (int i = 0; i < PER / 2; i++) o[i] = deq(*(const u16*)(r + w + 2 * i), 0x4140);
+    }
+#elif KV_BITS == 4
+    // Two values per byte, low nibble first; w is a multiple of PER and PER is even, so the run is whole bytes.
+    int w = off % hd;
+    const char* r = (const char*)c + off / hd * (hd * 9 / 16);
+    float d = h2f(*(const u16*)(r + (hd >> 1) + 2 * (w >> 5)));
+    for (int i = 0; i < PER / 2; i++) {
+        unsigned x = (unsigned char)r[(w >> 1) + i];
+        o[i] = h2pack((float)((int)(x & 15) - 8) * d, (float)((int)(x >> 4) - 8) * d);
+    }
+#elif KV_BITS == 2
+    // Four levels, four values per byte; the level is 2 * idx - 3 times the block scale.
+    int w = off % hd;
+    const char* r = (const char*)c + off / hd * (hd * 5 / 16);
+    float d = h2f(*(const u16*)(r + (hd >> 2) + 2 * (w >> 5)));
+    for (int i = 0; i < PER / 4; i++) {
+        unsigned x = (unsigned char)r[(w >> 2) + i];
+        float a = (float)(2 * (int)(x & 3) - 3) * d, b = (float)(2 * (int)((x >> 2) & 3) - 3) * d;
+        float c2 = (float)(2 * (int)((x >> 4) & 3) - 3) * d, e = (float)(2 * (int)((x >> 6) & 3) - 3) * d;
+        o[2 * i] = h2pack(a, b); o[2 * i + 1] = h2pack(c2, e);
     }
 #else
     ldh_raw<PER>(c + off, o);
@@ -1822,7 +1869,7 @@ __device__ void attn_decode_t(const float* q, const u16* kc, const u16* vc, floa
                  float scale, int gq_min, int pz, int nt, const int* sel, int sst
 #define ATT_TOK int t = blockIdx.x % nt; q += (size_t)t * nh * hd; part += (size_t)t * pz; step += 2 * t; if (sel) sel += (size_t)t * sst;
 #define ATT_RUN(G) attn_decode_t<PER, G>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
-#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_Q8 && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
+#define ATT_RUN_CP(G) attn_decode_t<PER, G, !KV_BITS && (PER == 4 || (PER == 8 && __CUDA_ARCH__ >= 800))>(q, kc, vc, part, step, sel, nh, nkv, scale, blockIdx.x / nt)
 #define DEF_ATT(HD)                                                                                          \
     extern "C" __global__ void attn_decode_##HD(ATT_ARGS) {                                                  \
         constexpr int PER = HD / 32; ATT_TOK                                                                 \
@@ -2039,7 +2086,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     int qp[2] = {pos0 + q0 + warp * 16 + g, pos0 + q0 + warp * 16 + g + 8};
     float o[HD / 8][4] = {}, m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
     constexpr int N = FA_BK * HD / 8 / 128;
-#if !KV_Q8
+#if !KV_BITS
     // f16: cp.async the V tile while the scores use K, and the next K tile while the sums use V (one block per SM,
     // so nothing else hides the loads). Rows past `last` are zero-filled.
     auto ld = [&](int k0, u16* dst, const u16* src) {
@@ -2054,9 +2101,9 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
     ld(0, vs, vc);
 #endif
     for (int k0 = 0; k0 <= last; k0 += FA_BK) {
-#if KV_Q8
+#if KV_BITS
         __syncthreads();
-        // All of a thread's loads, then its stores: with q8 the dequant between them kept the compiler from
+        // All of a thread's loads, then its stores: with a packed cache the dequant between them kept the compiler from
         // overlapping the loads. Rows past `last` load the row `last` and store zeros.
         uint4 kv[N], vv[N];
 #pragma unroll
@@ -2095,7 +2142,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 mma16816(s[nt + 1], a[0], a[1], a[2], a[3], b[2], b[3]);
             }
         }
-#if !KV_Q8
+#if !KV_BITS
         __syncthreads();
         if (k0 + FA_BK <= last) ld(k0 + FA_BK, ks, kc);
         else cp_async_commit();  // keep one group per tile for the waits
@@ -2123,7 +2170,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
 #pragma unroll
         for (int d = 0; d < HD / 8; d++) { o[d][0] *= c[0]; o[d][1] *= c[0]; o[d][2] *= c[1]; o[d][3] *= c[1]; }
         }
-#if !KV_Q8
+#if !KV_BITS
         cp_async_wait<1>();  // this V tile; the next K tile may still be in flight
         __syncthreads();
 #endif
@@ -2140,7 +2187,7 @@ __device__ __forceinline__ void attn_prefill_t(const float* q, const u16* kc, co
                 mma16816(o[d + 1], a0, a1, a2, a3, b[2], b[3]);
             }
         }
-#if !KV_Q8
+#if !KV_BITS
         __syncthreads();
         if (k0 + FA_BK <= last) ld(k0 + FA_BK, vs, vc);
         else cp_async_commit();

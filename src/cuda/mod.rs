@@ -36,8 +36,8 @@ pub struct Gpu {
     /// q8 rows of the last integer GEMM's X (see quant_q8 in kernels.cu), grown on demand, and which x they hold
     /// (x, x_stride, n_x, cols) for a `SAME_X` call; None after a call without it that did not quantize.
     q8: std::sync::Mutex<(CudaSlice<u8>, Option<[u64; 4]>)>,
-    /// The kernels were compiled for a q8 KV cache (`--kv q8`).
-    pub kv_q8: bool,
+    /// KV cache bits per value (0 = f16, 8, 4 or 2), chosen by `--kv`.
+    pub kv_bits: u32,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
     pub int8_mma: bool,
     /// `argmax_rows` partials, AMAX_PARTS per row.
@@ -71,10 +71,13 @@ unsafe impl Send for Graph {}
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
-/// `--kv q8`: KV cache rows in ggml q8_0 form (KV_Q8 in kernels.cu), read once by Gpu::new and Vk::new.
-pub fn kv_q8() -> bool { std::env::var_os("STRATA_KV_Q8").is_some() }
+/// `--kv q8` / `q4` / `q2`: KV cache rows packed at that many bits per value (KV_BITS in kernels.cu), read once by
+/// Gpu::new and Vk::new. 0 means f16.
+pub fn kv_bits() -> u32 {
+    match std::env::var("STRATA_KV_BITS").ok().as_deref() { Some("8") => 8, Some("4") => 4, Some("2") => 2, _ => 0 }
+}
 
-fn source(kv_q8: bool) -> String {
+fn source(kv_bits: u32) -> String {
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
@@ -84,7 +87,7 @@ fn source(kv_q8: bool) -> String {
          __device__ const unsigned int iq3xxs_grid[256] = {{{}}};\n\
          __device__ const unsigned int iq3s_grid[512] = {{{}}};\n\
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
-         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_Q8 {}\n{}",
+         __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n#define LLAMA_Q8 {}\n#define KV_BITS {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2XXS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
         join(IQ2S_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -94,7 +97,7 @@ fn source(kv_q8: bool) -> String {
         join(KSIGNS_IQ2XS.iter().map(|v| v.to_string()).collect()),
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         llama_numerics() as u8,
-        kv_q8 as u8,
+        kv_bits,
         include_str!("kernels.cu"),
     )
 }
@@ -171,8 +174,8 @@ fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name(
 
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
-        let kv_q8 = kv_q8();
-        anyhow::ensure!(!(kv_q8 && llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
+        let kv_bits = kv_bits();
+        anyhow::ensure!(!(kv_bits != 0 && llama_numerics()), "--kv q8/q4/q2 does not combine with --llama-numerics (its attention reads f16 KV)");
         if !unsafe { sys::is_culib_present() } {
             return Err(anyhow::anyhow!("no NVIDIA driver (libcuda.so)")).context("CUDA init");
         }
@@ -185,7 +188,7 @@ impl Gpu {
         let max_optin = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
             .unwrap_or(48 << 10).max(48 << 10) as u32;
         let arch: &'static str = Box::leak(format!("sm_{maj}{min}").into_boxed_str());
-        let module = ctx.load_module(ptx(&source(kv_q8), arch)?).context("load cubin")?;
+        let module = ctx.load_module(ptx(&source(kv_bits), arch)?).context("load cubin")?;
         let mut fns = HashMap::new();
         let names = KERNELS.iter().map(|s| s.to_string())
             .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
@@ -209,7 +212,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_q8, int8_mma, am, graphs: Default::default(), ring, done, lag: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, q8, kv_bits, int8_mma, am, graphs: Default::default(), ring, done, lag: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -344,7 +347,7 @@ impl Gpu {
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async.
         // Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do not fit, so it loads them
         // through registers instead (kernels.cu ATT_RUN_CP).
-        let cp = if !self.kv_q8 && (hd == 128 || (hd == 256 && self.int8_mma)) { 2 * 2 * 32 * hd * 2 } else { 0 };
+        let cp = if self.kv_bits == 0 && (hd == 128 || (hd == 256 && self.int8_mma)) { 2 * 2 * 32 * hd * 2 } else { 0 };
         if gq_min != i32::MAX { launch!(self, &format!("attn_decode_gqa_{hd}"), cfg(((nh / g * nt) as u32, ATT_SPLITS as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32); }
         launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 }, part, qg, out, hd as i32, ATT_SPLITS as i32, step, ATT_SPLITS_1 as i32, gq_min, xq);
         Ok(())
@@ -700,11 +703,11 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn kv_words(&self, n: usize) -> usize { if self.kv_q8 { n * 17 / 32 } else { n } }
+    fn kv_words(&self, n: usize) -> usize { match self.kv_bits { 8 => n * 17 / 32, 4 => n * 9 / 32, 2 => n * 5 / 32, _ => n } }
 
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8: each warp quantizes one 32-value block of one row.
-        anyhow::ensure!(!self.kv_q8 || (hd % 32 == 0 && n % hd == 0), "q8 KV cache: head_dim {hd} is not a multiple of 32");
+        anyhow::ensure!(self.kv_bits == 0 || (hd % 32 == 0 && n % hd == 0), "packed KV cache: head_dim {hd} is not a multiple of 32");
         launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
         Ok(())
     }

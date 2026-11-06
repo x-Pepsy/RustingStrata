@@ -72,9 +72,10 @@ struct Engine {
     /// template's default.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     preserve_thinking: bool,
-    /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
-    /// llama.cpp's default f16 cache).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+    /// KV cache format (GPU): f16, q8, q4 or q2. q4 halves the cache against q8 and costs nothing measurable; q2
+    /// quarters it but its decode is ~25% slower on this kernel, so it only pays on a card where the freed VRAM
+    /// buys enough experts to cover that.
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
     kv: String,
     /// GPU backend: cuda or vulkan [default: cuda if it loads, else vulkan].
     #[arg(long)]
@@ -155,7 +156,7 @@ impl Engine {
     /// Fills settings not given on the command line from the model's calibration file, else built-in defaults.
     fn runner<'a>(&mut self, m: &'a Model<'a>, model: &Path) -> anyhow::Result<Runner<'a>> {
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+        if matches!(self.kv.as_str(), "q8" | "q4" | "q2") { unsafe { std::env::set_var("STRATA_KV_BITS", &self.kv[1..]) } }  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { eprintln!("no GPU backend ({e:#}), running on the CPU"); None }
@@ -296,7 +297,7 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         device: usize,
         /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
-        #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+        #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
         kv: String,
         /// Accepted for symmetry with the other commands: calibration always runs on the GPU.
         #[arg(long, hide = true)]
@@ -502,7 +503,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, gpu: _ } => {
-            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+            if matches!(kv.as_str(), "q8" | "q4" | "q2") { unsafe { std::env::set_var("STRATA_KV_BITS", &kv[1..]) } }  // read by Gpu::new and Vk::new
             calibrate(&model, ctx, vram_margin << 20, backend.as_deref(), device)?
         }
         Cmd::Chat { model, system, n, think, mut engine } => {

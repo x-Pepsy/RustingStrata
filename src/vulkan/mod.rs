@@ -310,7 +310,8 @@ fn features<'a>(f11: &'a mut vk::PhysicalDeviceVulkan11Features<'static>, f12: &
 impl Vk {
     /// The `device`-th usable GPU. Fails with "Vulkan init" (and the reasons) when there is none.
     pub fn new(device: usize) -> anyhow::Result<Vk> {
-        ensure!(!(crate::cuda::kv_q8() && crate::cuda::llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
+        ensure!(crate::cuda::kv_bits() == 0 || crate::cuda::kv_bits() == 8, "--kv q4/q2 is not implemented on the Vulkan backend");
+    ensure!(!(crate::cuda::kv_bits() == 8 && crate::cuda::llama_numerics()), "--kv q8 does not combine with --llama-numerics (its attention reads f16 KV)");
         // RADV hides VK_AMD_device_coherent_memory on RDNA4 (RX 9000) unless this driconf option is set, and without
         // it the GPU caches the CPU expert mailbox: MoE combines miss the worker's answer and wait until they give up.
         // Mesa reads the option from the environment when the device is created; other drivers ignore it.
@@ -408,7 +409,7 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_bits() == 8, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
