@@ -397,3 +397,49 @@ impl Hold {
     /// The text not sent yet.
     pub fn rest(&self) -> &str { &self.text[self.sent..] }
 }
+
+/// The tag the chat template closes the model's think block with: everything before it is reasoning, everything
+/// after it is the answer.
+pub const THINK_END: &str = "</think>";
+
+/// Splits a whole reply into its reasoning and its answer, as an assistant message carries them
+/// (`reasoning_content` and `content`).
+pub fn think_parts(text: &str) -> (&str, &str) {
+    text.split_once(THINK_END).map_or((text, ""), |(r, a)| (r, a))
+}
+
+/// Splits a streamed reply at `THINK_END` while it is generated: `push` returns what is safe to send as reasoning
+/// and as content now, holding back a tail that could still be the start of the closing tag. With thinking off the
+/// reply is all content.
+#[derive(Default)]
+pub struct Think {
+    open: bool,
+    tail: String,
+}
+
+impl Think {
+    pub fn new(think: bool) -> Think { Think { open: think, ..Think::default() } }
+
+    /// Feeds the text just released by `Hold`; returns the reasoning and the content to send now.
+    pub fn push(&mut self, piece: &str) -> (String, String) {
+        if !self.open { return (String::new(), piece.to_string()); }
+        self.tail += piece;
+        if let Some(p) = self.tail.find(THINK_END) {
+            let rest = std::mem::take(&mut self.tail);
+            self.open = false;
+            return (rest[..p].to_string(), rest[p + THINK_END.len()..].to_string());
+        }
+        // Keep the longest end that could still be the start of the tag.
+        let keep = THINK_END.char_indices().skip(1).map(|(k, _)| &THINK_END[..k])
+            .filter(|p| self.tail.ends_with(p)).map(str::len).max().unwrap_or(0);
+        let cut = self.tail.len() - keep;
+        let reasoning = self.tail[..cut].to_string();
+        self.tail = self.tail[cut..].to_string();
+        (reasoning, String::new())
+    }
+
+    /// What is left of the reasoning when the reply ends inside the think block (max tokens, or a stop string).
+    pub fn finish(&mut self) -> String {
+        if self.open { std::mem::take(&mut self.tail) } else { String::new() }
+    }
+}

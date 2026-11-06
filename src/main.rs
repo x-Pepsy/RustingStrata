@@ -3,7 +3,7 @@ use anyhow::Context;
 use rusting_strata::model::{Model, State};
 use rusting_strata::{backend, gpu_model::GpuModel};
 use rusting_strata::{config::ModelConfig, gguf::Gguf, hf, ops, ops::Sampler, quant::GgmlType, serve, tokenizer::Tokenizer};
-use rusting_strata::chat::{Hold, Msg, Template};
+use rusting_strata::chat::{Hold, Msg, Template, Think, think_parts};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::{collections::{BTreeMap, VecDeque}, net::{TcpListener, TcpStream}, sync::atomic::Ordering::Relaxed, path::{Path, PathBuf}, time::{Duration, Instant, SystemTime}};
@@ -1054,14 +1054,30 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         write!(w, "data: {}\n\n", chunk(json!({"role": "assistant", "content": ""}), None))?;
                     }
                 }
-                decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
+                // The think block goes out as `reasoning_content`, the answer as `content` (the Messages API
+                // stream here still starts the text block with the answer only).
+                let mut think = Think::new(req.think);
+                let r = decode(r, tok, e.mtp() > 0, &mut smp, logits, n, &mut |t| {
                     s.stats.lock().unwrap().live_tokens += 1;
                     let t = hold.push(t);
-                    if req.stream && !t.is_empty() {
-                        if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": t}), None))?; } else { text_delta(&mut w, &mut opened, &t)?; }
+                    if !t.is_empty() {
+                        let (reasoning, content) = think.push(t);
+                        if req.stream && !reasoning.is_empty() && !anth {
+                            write!(w, "data: {}\n\n", chunk(json!({"reasoning_content": reasoning}), None))?;
+                        }
+                        if req.stream && !content.is_empty() {
+                            if !anth { write!(w, "data: {}\n\n", chunk(json!({"content": content}), None))?; }
+                            else { text_delta(&mut w, &mut opened, &content)?; }
+                        }
                     }
                     Ok(hold.stopped)
-                })
+                })?;
+                // Cut off inside the think block (max tokens, or a stop string): what is left is still reasoning.
+                let left = think.finish();
+                if req.stream && !left.is_empty() && !anth {
+                    write!(w, "data: {}\n\n", chunk(json!({"reasoning_content": left}), None))?;
+                }
+                Ok(r)
             })();
             {
                 let mut st = s.stats.lock().unwrap();
@@ -1127,7 +1143,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 last["usage"] = usage;
                 Ok(write!(w, "data: {last}\n\ndata: [DONE]\n\n")?)
             } else {
-                let message = match &calls { Some(c) => calls_json(c, false), None => json!({"role": "assistant", "content": hold.text}) };
+                // Non-streaming: the think block becomes `reasoning_content`, the answer `content`.
+                let (reasoning, content) = if req.think { think_parts(&hold.text) } else { ("", hold.text.as_str()) };
+                let mut message = match &calls {
+                    Some(c) => calls_json(c, false),
+                    None => json!({"role": "assistant", "content": content}),
+                };
+                if !reasoning.is_empty() { message["reasoning_content"] = json!(reasoning); }
                 send(&mut w, "200 OK", json!({"id": id, "object": "chat.completion", "created": created, "model": name,
                     "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}))
             }
@@ -1175,6 +1197,10 @@ struct ChatJob {
     eos: Vec<u32>,
     n: usize,
     hold: Hold,
+    /// Splits the streamed text into the think block (`reasoning_content`) and the answer.
+    think: Think,
+    /// The request asked for the think block (`req.think`).
+    think_on: bool,
     opened: bool,
     text: String,
     id: String,
@@ -1228,6 +1254,7 @@ impl ChatJob {
         let tools = req.tool_calls && !req.tools.is_empty();
         let prompt_tokens = ids.len();
         let req_stop = req.stop.clone();
+        let think_on = req.think;
         let t0 = Instant::now();
         // Prefill before the first byte goes out, as the serial path does; the state is parked so another sequence
         // can run before this one's first quantum.
@@ -1253,8 +1280,8 @@ impl ChatJob {
             (logits, reused, t1)
         };
         Ok(Some(ChatJob { w, i, anth, req, tools, ids, out: Vec::new(), start: 0, ahead: None, logits, smp,
-            eos: l.tok.eos_ids(), n, hold: Hold::new(tools, req_stop), opened: false, text: String::new(), id, created,
-            name, prompt_tokens, cached, n_system, t0, t1, stop: false, done: false }))
+            eos: l.tok.eos_ids(), n, hold: Hold::new(tools, req_stop), think: Think::new(think_on), think_on, opened: false,
+            text: String::new(), id, created, name, prompt_tokens, cached, n_system, t0, t1, stop: false, done: false }))
     }
 
     /// Generate up to `q` tokens for this reply. The caller leaves this reply's state in the model (see `adopt` and
@@ -1292,14 +1319,26 @@ impl ChatJob {
         if emitted > 0 { s.stats.lock().unwrap().live_tokens += emitted; }
         if self.req.stream && !self.text.is_empty() {
             let text = std::mem::take(&mut self.text);
+            let (reasoning, content) = self.think.push(&text);
             if self.anth {
-                text_delta(&mut self.w, &mut self.opened, &text)?;
+                if !content.is_empty() { text_delta(&mut self.w, &mut self.opened, &content)?; }
             } else {
-                let c = chunk_json(&self.id, self.created, &self.name, json!({"content": text}), None);
-                write!(self.w, "data: {c}\n\n")?;
+                for (field, piece) in [("reasoning_content", reasoning), ("content", content)] {
+                    if piece.is_empty() { continue; }
+                    let c = chunk_json(&self.id, self.created, &self.name, json!({ field: piece }), None);
+                    write!(self.w, "data: {c}\n\n")?;
+                }
             }
         }
-        if self.done { self.finish(tpl, name, s)?; }
+        if self.done {
+            // Cut off inside the think block: the rest is still reasoning.
+            let left = self.think.finish();
+            if self.req.stream && !left.is_empty() && !self.anth {
+                let c = chunk_json(&self.id, self.created, &self.name, json!({"reasoning_content": left}), None);
+                write!(self.w, "data: {c}\n\n")?;
+            }
+            self.finish(tpl, name, s)?;
+        }
         Ok(())
     }
 
@@ -1373,7 +1412,12 @@ impl ChatJob {
             last["usage"] = usage;
             write!(self.w, "data: {last}\n\ndata: [DONE]\n\n")?;
         } else {
-            let message = match &calls { Some(c) => calls_json(c, false), None => json!({"role": "assistant", "content": &self.hold.text}) };
+            let (reasoning, content) = if self.think_on { think_parts(&self.hold.text) } else { ("", self.hold.text.as_str()) };
+            let mut message = match &calls {
+                Some(c) => calls_json(c, false),
+                None => json!({"role": "assistant", "content": content}),
+            };
+            if !reasoning.is_empty() { message["reasoning_content"] = json!(reasoning); }
             reply(&mut self.w, "200 OK", json!({"id": self.id, "object": "chat.completion", "created": self.created, "model": self.name,
                 "choices": [{"index": 0, "message": message, "finish_reason": finish}], "usage": usage}))?;
         }
