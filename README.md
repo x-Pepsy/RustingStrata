@@ -116,7 +116,10 @@ Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative de
 head; greedy tokens stay the same, sampling keeps its distribution), `--chunk`, `--threads`, `--vram-margin`. On a
 GPU that drives no display, `--vram-margin 256` keeps more experts resident (+1-2% prefill); 128 runs out of
 memory. `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower
-32K prefill. Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking.
+32K prefill. `--ctx-start N` allocates only N tokens of KV at load and grows it towards `--ctx` when a conversation
+needs it, so a small GPU keeps the VRAM in expert slots until then (on a 6 GB card at `--ctx 131072`, going from
+8192 to 131072 tokens of cache costs 42% of decode speed: 109 vs 76 tok/s). Without `--gpu` everything runs on the
+CPU reference, which is slow and meant for checking.
 
 Several GPUs: `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay
 resident. The cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP

@@ -164,6 +164,8 @@ impl GpuModel<'_> {
 
     /// `input`: the hidden rows and PLE input from the part before (None: embed `toks`).
     fn prefill_chunk(&mut self, toks: &[u32], input: Option<(&[f32], &[f32])>) -> anyhow::Result<()> {
+        // The KV rows for these tokens are written here, before `pass` runs: make room first.
+        self.ensure_kv(toks.len())?;
         // Missed experts are read from the mapped weights in the order the staging copies take them.
         let pre = self.cache.is_some().then(Prefetch::start);
         let owned: (Vec<f32>, Vec<f32>);

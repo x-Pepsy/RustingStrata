@@ -131,6 +131,9 @@ pub struct GpuModel<'a> {
     /// Host memory for `parked`, in bytes (0 = keep none).
     pub cache_ram: usize,
     ctx: usize,
+    /// Tokens the KV cache is allocated for now: it starts at `--ctx-start` and grows towards `ctx` when a
+    /// conversation needs more, giving the memory back to the expert slots while it lasts.
+    pub kv_cap: usize,
     pub pos: usize,
     pub cache: Option<ExpertCache>,
     /// Swap experts every this many tokens (0 = fixed placement).
@@ -162,15 +165,27 @@ pub struct GpuModel<'a> {
 
 impl<'a> GpuModel<'a> {
     /// `chunk`: prefill batch in tokens (0 = no batched prefill). `mtp`: load the MTP draft head (needs `nextn`).
+    /// The KV cache is allocated for all of `ctx`; `load_with` starts smaller and lets it grow.
     pub fn load(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
-        Self::load_part(m, gpu, ctx, chunk, vram_margin, k, 0..m.cfg.n_layer)
+        Self::load_with(m, gpu, ctx, chunk, vram_margin, k, ctx)
+    }
+
+    /// `load` with `kv_start` tokens of KV cache allocated at first: a conversation that outgrows them makes the
+    /// cache grow towards `ctx` (`ensure_kv`), trading expert slots for context only when it has to.
+    pub fn load_with(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, kv_start: usize) -> anyhow::Result<GpuModel<'a>> {
+        Self::load_part(m, gpu, ctx, chunk, vram_margin, k, kv_start, 0..m.cfg.n_layer)
     }
 
     /// `load` with the layers split over `gpus` in proportion to their free VRAM (each device then fills the rest
     /// of its VRAM with expert slots). One device: `load`.
     pub fn load_split(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: usize, k: usize) -> anyhow::Result<GpuModel<'a>> {
+        Self::load_split_with(m, gpus, ctx, chunk, vram_margin, k, ctx)
+    }
+
+    /// `load_split` with the KV cache starting at `kv_start` tokens (see `load_with`).
+    pub fn load_split_with(m: &'a Model<'a>, gpus: Vec<Box<dyn Backend>>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, kv_start: usize) -> anyhow::Result<GpuModel<'a>> {
         let n = m.cfg.n_layer;
-        if gpus.len() == 1 { return Self::load(m, gpus.into_iter().next().unwrap(), ctx, chunk, vram_margin, k); }
+        if gpus.len() == 1 { return Self::load_with(m, gpus.into_iter().next().unwrap(), ctx, chunk, vram_margin, k, kv_start); }
         let free = gpus.iter().map(|g| Ok(g.mem_info()?.0 as f64)).collect::<anyhow::Result<Vec<_>>>()?;
         let total: f64 = free.iter().sum();
         let mut ends = vec![0];
@@ -185,7 +200,7 @@ impl<'a> GpuModel<'a> {
             ensure!(ple.iter().all(|il| r.contains(il)) || !ple.iter().any(|il| r.contains(il)), "the PLE layers would be split across devices");
             eprintln!("device {i} ({}): layers {}..{}", gpu.name(), r.start, r.end);
             // ponytail: no MTP draft head on a split model (it reads the last part's hidden rows from the first).
-            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, r)?);
+            parts.push(Self::load_part(m, gpu, ctx, chunk, vram_margin, 0, kv_start, r)?);
         }
         let mut it = parts.into_iter().rev();
         let mut acc = it.next().unwrap();
@@ -193,7 +208,7 @@ impl<'a> GpuModel<'a> {
         Ok(acc)
     }
 
-    fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, range: std::ops::Range<usize>) -> anyhow::Result<GpuModel<'a>> {
+    fn load_part(m: &'a Model<'a>, gpu: Box<dyn Backend>, ctx: usize, chunk: usize, vram_margin: usize, k: usize, kv_start: usize, range: std::ops::Range<usize>) -> anyhow::Result<GpuModel<'a>> {
         let last = range.end == m.cfg.n_layer;
         // The PLE table stays on the CPU; other F16, Q4_0 and Q5_0 tensors but experts are converted on upload
         // (`Backend::upload`).
@@ -218,6 +233,9 @@ impl<'a> GpuModel<'a> {
         let kv = c.n_head_kv * c.head_dim;
         let qsa_on = c.idx_top_k > 0 && (0..c.n_layer).any(|il| m.w.layer(il, "indexer.k_proj.weight").is_ok());
         if qsa_on { ensure!(c.idx_head_dim == QSA_D && c.idx_n_head == QSA_H, "QSA indexer: {} heads of {} (the GPU kernels take {QSA_H} of {QSA_D})", c.idx_n_head, c.idx_head_dim); }
+        // The KV cache starts at `kv_start` tokens and grows on demand (`ensure_kv`). The sparse indexer pools keys
+        // for the whole window, so a model with QSA keeps the full-size cache.
+        let kv_cap = if qsa_on { ctx } else { kv_start.clamp(1, ctx) };
         let ring = gpu.zeros::<f32>(if qsa_on { c.n_layer * QSA_RING } else { 1 })?;
 
         // ponytail: no MTP or batched prefill with hyper-connections yet (their state and row layouts assume one stream).
@@ -236,7 +254,7 @@ impl<'a> GpuModel<'a> {
                 Mixer::Attn {
                     q: lt(il, "attn_q.weight")?, k: lt(il, "attn_k.weight")?, v: lt(il, "attn_v.weight")?,
                     qn: lt(il, "attn_q_norm.weight")?, kn: lt(il, "attn_k_norm.weight")?, o: lt(il, "attn_output.weight")?,
-                    kc: gpu.zeros::<u16>(gpu.kv_words(ctx * kv))?, vc: gpu.zeros::<u16>(gpu.kv_words(ctx * kv))?,
+                    kc: gpu.zeros::<u16>(gpu.kv_words(kv_cap * kv))?, vc: gpu.zeros::<u16>(gpu.kv_words(kv_cap * kv))?,
                     qsa: if qsa_on && il < c.n_layer && m.w.layer(il, "indexer.k_proj.weight").is_ok() {
                         Some(Qsa {
                             kp: lt(il, "indexer.k_proj.weight")?, qp: lt(il, "indexer.q_proj.weight")?,
@@ -332,8 +350,8 @@ impl<'a> GpuModel<'a> {
         let worker = if c.is_moe() { Some(CpuWorker::new(m, &*gpu, range.clone().collect())?) } else { None };
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!(
-            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
-            mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(ctx * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()), mb(pf.as_ref().map_or(0, |p| p.bytes())),
+            "plan: weights+state+scratch {:.0} MB (KV {:.0} MB for {} of {ctx} tokens, prefill {:.0} MB), expert slots {:.0} MB, resident experts {}/{}",
+            mb(free0.saturating_sub(free1)), mb(2 * 2 * gpu.kv_words(kv_cap * kv) * c.layers[range.clone()].iter().filter(|&&k| k == LayerKind::Attn).count()), kv_cap, mb(pf.as_ref().map_or(0, |p| p.bytes())),
             mb(cache.as_ref().map_or(0, |x| x.slot_bytes_total())),
             cache.as_ref().map_or(0, |x| x.resident_count()), cache.as_ref().map_or(0, |x| x.total_experts()),
         );
@@ -344,7 +362,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, kv_cap, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -370,9 +388,64 @@ impl<'a> GpuModel<'a> {
     /// The part that computes the logits.
     fn tail(&self) -> &GpuModel<'a> { self.parts().last().unwrap() }
 
+    /// Room for `nt` more tokens: grow the KV cache towards `ctx`, taking the memory from the expert slots.
+    fn ensure_kv(&mut self, nt: usize) -> anyhow::Result<()> {
+        let need = self.pos + nt;
+        if need <= self.kv_cap { return Ok(()); }
+        anyhow::ensure!(need <= self.ctx, "context full ({} tokens; raise --ctx)", self.ctx);
+        let cap = (self.kv_cap * 2).max(need).min(self.ctx);
+        self.grow_kv(cap)
+    }
+
+    /// Reallocate the KV cache for `cap` tokens, copying the rows in use, and rebuild the expert cache smaller: a
+    /// conversation that outgrows the starting window trades expert slots for context, and only then.
+    fn grow_kv(&mut self, cap: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(cap > self.kv_cap && cap <= self.ctx, "grow_kv: {cap} tokens (have {}, at most {})", self.kv_cap, self.ctx);
+        let m = self.m;
+        let kv = m.cfg.n_head_kv * m.cfg.head_dim;
+        let words = self.gpu.kv_words(cap * kv);
+        let bytes = self.gpu.kv_words(self.pos.min(self.kv_cap) * kv) * std::mem::size_of::<u16>();
+        // The slots the cache holds now, and the KV bytes this will add: the difference is what the slots lose.
+        // (`mem_info` cannot be asked: the backend's allocator keeps freed buffers in its pool, so the free total
+        // does not move.)
+        let slots = self.cache.as_ref().map_or(0, |c| c.slot_bytes_total());
+        let kv_before: usize = self.kv_bufs().iter().map(|b| b.len()).sum();
+        // Queue a sync before the slots go: their memory is what the larger cache needs, and kernels already
+        // queued may still read them. The routing counts learned so far go to the profile first, so the rebuilt
+        // cache starts from what this session saw instead of what was on disk.
+        self.gpu.sync()?;
+        if let Some(c) = self.cache.as_ref() { let _ = c.save_profile(); }
+        drop(self.cache.take());
+        // The driver only counts freed buffers once the stream is idle again.
+        self.gpu.sync()?;
+        self.gpu.clear_graphs();
+        let mut mtp = self.mtp.as_mut().map(|h| &mut h.layer);
+        for l in self.layers.iter_mut().chain(mtp.as_deref_mut()) {
+            let Mixer::Attn { kc, vc, .. } = &mut l.mixer else { continue };
+            let (nk, nv) = (self.gpu.zeros::<u16>(words)?, self.gpu.zeros::<u16>(words)?);
+            self.gpu.dtod(kc, 0, &nk, 0, bytes)?;
+            self.gpu.dtod(vc, 0, &nv, 0, bytes)?;
+            (*kc, *vc) = (nk, nv);
+        }
+        self.kv_cap = cap;
+        if m.cfg.is_moe() {
+            let kv_after: usize = self.kv_bufs().iter().map(|b| b.len()).sum();
+            // `STRATA_EXPERT_MB` pins the placement: it wins unless it was not the binding limit.
+            let cap_env = std::env::var("STRATA_EXPERT_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(usize::MAX, |v| v << 20);
+            let budget = if cap_env < slots { cap_env } else { slots.saturating_sub(kv_after - kv_before) };
+            let n = self.layers.len() + self.mtp.is_some() as usize;
+            let first = self.first;
+            self.cache = Some(ExpertCache::new(m, &*self.gpu, budget, first..first + n)?);
+        }
+        eprintln!("kv cache: grown to {cap} tokens, expert slots {:.0} MB",
+            self.cache.as_ref().map_or(0.0, |c| c.slot_bytes_total() as f64 / 1048576.0));
+        Ok(())
+    }
+
     /// Run the forward of `nt` tokens (input in `x`, per-token values in `step_buf`) through this part and the
     /// parts after it. The last part's forward is left running, as `run` leaves it.
     fn pass(&mut self, nt: usize) -> anyhow::Result<()> {
+        self.ensure_kv(nt)?;
         let t0 = std::time::Instant::now();
         self.run(nt)?;
         if self.next.is_none() { return Ok(()); }
@@ -528,11 +601,11 @@ impl<'a> GpuModel<'a> {
         let n = self.saved_ids.len();
         // ponytail: a split model parks nothing (each part would need its own copy, in step with the others).
         if n == 0 || self.next.is_some() { return Ok(()) }
-        let kv = self.kv_bufs().iter().map(|b| b.len() / self.ctx * n).sum::<usize>();
+        let kv = self.kv_bufs().iter().map(|b| b.len() / self.kv_cap * n).sum::<usize>();
         if kv + self.slot().iter().map(|b| b.len()).sum::<usize>() > self.cache_ram { return Ok(()) }
         let g = &self.gpu;
         let slot = self.slot().iter().map(|b| g.get::<u8>(b, 0, b.len())).collect::<anyhow::Result<_>>()?;
-        let kv = self.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / self.ctx * n)).collect::<anyhow::Result<_>>()?;
+        let kv = self.kv_bufs().iter().map(|b| g.get::<u8>(b, 0, b.len() / self.kv_cap * n)).collect::<anyhow::Result<_>>()?;
         self.parked.insert(0, Parked { ids: self.saved_ids.clone(), ple_prev: self.saved_ple_prev, slot, kv });
         while self.parked.iter().map(Parked::bytes).sum::<usize>() > self.cache_ram { self.parked.pop(); }
         Ok(())

@@ -465,6 +465,9 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    /// Forget the recorded graphs (they captured KV pointers that a reallocation replaces).
+    fn clear_graphs(&self) { self.graphs.lock().unwrap().clear(); }
+
     /// Pinned host memory mapped into the device address space.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);

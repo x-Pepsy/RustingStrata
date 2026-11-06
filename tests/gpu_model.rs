@@ -101,6 +101,7 @@ fn mtp_draft_matches_reference() {
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
         let mut gm = GpuModel::load(&m, gpu, 256, 0, usize::MAX / 2, 1).unwrap();
+        gm.adapt_every = 0;  // adaptive moves change the numerics between the two paths compared here
         let mut ids = tok.encode("The capital of France is").unwrap();
         let (mut st, mut mtp) = (State::new(&m.cfg), Mtp::default());
         let mut bad = 0;
@@ -131,6 +132,7 @@ fn verify_matches_steps() {
     for (bk, gpu) in common::backends() {
         eprintln!("backend {bk}");
         let mut gm = GpuModel::load(&m, gpu, 256, 0, 512 << 20, 0).unwrap();
+        gm.adapt_every = 0;  // adaptive moves change the numerics between the two paths compared here
         let ids = tok.encode("The capital of France is Paris, and the capital of Spain is").unwrap();
         let (pre, rest) = ids.split_at(ids.len() - 4);
         for &t in pre { gm.step(t).unwrap(); }

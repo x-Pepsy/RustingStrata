@@ -25,6 +25,10 @@ struct Engine {
     /// GPU context length (KV cache size) in tokens.
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
+    /// KV cache allocated at load, in tokens; it grows towards `--ctx` only when a conversation needs it, so the
+    /// VRAM stays with the expert slots until then (0 = allocate `--ctx` from the start).
+    #[arg(long, default_value_t = 0)]
+    ctx_start: usize,
     /// Prefill chunk in tokens (GPU; 0 = token by token) [default: calibrated, else 4096].
     #[arg(long)]
     chunk: Option<usize>,
@@ -172,7 +176,7 @@ impl Engine {
         if self.parallel > 1 {
             if self.mtp() > 0 { eprintln!("--parallel > 1: MTP is off while replies take turns"); }
             self.mtp = Some(0);
-        }        let mut g = GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
+        }        let mut g = GpuModel::load_split_with(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp(), self.kv_start()).context(LOAD_HINT)?;
         g.short = self.short;
         g.cache_ram = self.cache_ram << 20;
         if self.mtp() > 0 && g.k == 0 {
@@ -186,6 +190,8 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+    /// KV tokens to allocate at load: `--ctx-start`, or all of `--ctx` when it is 0.
+    fn kv_start(&self) -> usize { if self.ctx_start == 0 { self.ctx } else { self.ctx_start.min(self.ctx).max(1) } }
 }
 
 /// The negative log-likelihood of `tok` under `logits`, and in `row` the log-probabilities as llama-perplexity stores
@@ -908,6 +914,7 @@ fn gpu_stats(r: &Runner, s: &mut serve::Stats) {
         s.vram = g.gpu.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64));
         s.experts = g.cache.as_ref().map(|_| (g.hits as u64, g.misses as u64));
         s.drafts = (g.drafts.0 > 0).then_some((g.drafts.0 as u64, g.drafts.1 as u64));
+        s.kv_cap = g.kv_cap;
     }
 }
 

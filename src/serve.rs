@@ -176,6 +176,8 @@ pub struct Stats {
     pub backend: String,
     pub device: String,
     pub ctx: usize,
+    /// Tokens of KV cache allocated now: it starts at `--ctx-start` and grows towards `ctx` on demand.
+    pub kv_cap: usize,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
     /// MoE expert cache hits and misses, and MTP drafts tried and accepted, since the model loaded.
