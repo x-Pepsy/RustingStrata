@@ -513,7 +513,7 @@ impl<'a> Model<'a> {
     /// RoPE for one head: 1-D when the model has no M-RoPE sections, otherwise `[t, y, x, z]`.
     fn rope(&self, x: &mut [f32], kv_pos: usize, rope_pos: [i32; 4]) {
         match self.cfg.mrope_sections {
-            Some(sections) => ops::rope_mrope(x, self.cfg.n_rot, rope_pos, sections, self.cfg.rope_base),
+            Some(sections) => ops::rope_mrope_freq(x, self.cfg.n_rot, rope_pos, sections, &self.cfg.rope_freqs),
             None => ops::rope_neox_freq(x, self.cfg.n_rot, kv_pos, &self.cfg.rope_freqs),
         }
     }

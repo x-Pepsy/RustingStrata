@@ -96,14 +96,19 @@ pub fn rope_vision(x: &mut [f32], y: i32, x_pos: i32, base: f32) {
 /// Text-model M-RoPE: pairs `(i, i + n_rot/2)`, the section only selects the position; the theta exponent is
 /// global `i`, matching `ggml_rope_multi` for `GGML_ROPE_TYPE_MROPE`.
 pub fn rope_mrope(x: &mut [f32], n_rot: usize, pos: [i32; 4], sections: [usize; 4], base: f32) {
+    let freq: Vec<f32> = (0..n_rot / 2).map(|i| base.powf(-2.0 * i as f32 / n_rot as f32)).collect();
+    rope_mrope_freq(x, n_rot, pos, sections, &freq)
+}
+
+/// `rope_mrope` with the per-pair frequencies already worked out (so YaRN scaling applies to M-RoPE too).
+pub fn rope_mrope_freq(x: &mut [f32], n_rot: usize, pos: [i32; 4], sections: [usize; 4], freq: &[f32]) {
     let half = n_rot / 2;
-    let theta_scale = base.powf(-2.0 / n_rot as f32);
     let mut ends = [0usize; 4];
     let mut acc = 0;
     for i in 0..4 { acc += sections[i]; ends[i] = acc; }
     for i in 0..half {
         let sec = if i < ends[0] { 0 } else if i < ends[1] { 1 } else if i < ends[2] { 2 } else { 3 };
-        let theta = pos[sec] as f32 * theta_scale.powi(i as i32);
+        let theta = pos[sec] as f32 * freq[i];
         let (s, c) = (theta.sin(), theta.cos());
         let (a, b) = (x[i], x[i + half]);
         x[i] = a * c - b * s;

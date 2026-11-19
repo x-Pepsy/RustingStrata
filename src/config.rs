@@ -62,13 +62,14 @@ pub struct Yarn {
 }
 /// How many trailing layers are MTP draft layers. `nextn_predict_layers` can outlive the draft head tensors (a
 /// finetune that drops the head keeps the base model's metadata), so the declared count is kept only when the
-/// tensors of the first draft layer are there; the `Err` carries the warning to print. `block_count` includes them.
-fn nextn_present(declared: usize, block_count: usize, has: impl Fn(&str) -> bool) -> Result<usize, String> {
-    if declared == 0 || declared >= block_count { return Ok(0); }
+/// tensors of the first draft layer are there; the `Err` carries the warning to print. `block_count` includes the
+/// draft layers, so the real layer count subtracts them either way.
+fn nextn_present(declared: usize, block_count: usize, has: impl Fn(&str) -> bool) -> (usize, usize, Result<(), String>) {
+    if declared == 0 || declared >= block_count { return (block_count, 0, Ok(())); }
     let first = block_count - declared;
-    if has(&format!("blk.{first}.nextn.eh_proj.weight")) { return Ok(declared); }
-    Err(format!("no MTP draft tensors (blk.{first}.nextn.*): loading without the draft head, though the metadata \
-        declares nextn_predict_layers={declared}"))
+    if has(&format!("blk.{first}.nextn.eh_proj.weight")) { return (first, declared, Ok(())); }
+    (first, 0, Err(format!("no MTP draft tensors (blk.{first}.nextn.*): loading without the draft head, though the \
+        metadata declares nextn_predict_layers={declared}")))
 }
 
 /// The per-pair rope frequencies (`theta = pos * freq[i]`, `n_rot / 2` of them) for `base`, with YaRN applied when
@@ -175,9 +176,9 @@ impl ModelConfig {
         // A finetuned model can keep `nextn_predict_layers` from its base while dropping the draft head's tensors:
         // trusting the metadata would then load layer `block_count - n_nextn` from tensors that are not there.
         let block_count = req("block_count")?;
-        let n_nextn = nextn_present(opt("nextn_predict_layers"), block_count,
-            |n| g.tensors.contains_key(n)).unwrap_or_else(|n| { eprintln!("{n}"); 0 });
-        let n_layer = block_count - n_nextn;
+        let (n_layer, n_nextn, missing) = nextn_present(opt("nextn_predict_layers"), block_count,
+            |n| g.tensors.contains_key(n));
+        if let Err(n) = missing { eprintln!("{n}"); }
         let layers: Vec<LayerKind> = if a.hybrid {
             let every = match opt("full_attention_interval") { 0 => 4, v => v };
             (0..n_layer).map(|il| if (il + 1) % every == 0 { LayerKind::Attn } else { LayerKind::Delta }).collect()
@@ -267,8 +268,6 @@ impl ModelConfig {
         anyhow::ensure!(!has_delta || (nk > 0 && nv > 0 && nv % nk == 0 && c.ssm_d_inner % nv == 0),
             "bad ssm dims: group_count {nk}, time_step_rank {nv}, inner_size {}", c.ssm_d_inner);
         c.rope_freqs = c.rope_freq();
-        anyhow::ensure!(c.rope_yarn.is_none() || c.mrope_sections.is_none(),
-            "YaRN rope scaling is not implemented together with M-RoPE");
         Ok(c)
     }
 
@@ -289,14 +288,17 @@ impl ModelConfig {
 mod rope_freq_tests {
     use super::*;
 
-    /// The draft head's metadata is trusted only when its tensors are there.
+    /// The draft head's metadata is trusted only when its tensors are there, and the real layer count never
+    /// includes the draft layers either way.
     #[test]
     fn a_missing_draft_head_is_not_loaded() {
         let has = |n: &str| n == "blk.40.nextn.eh_proj.weight";
-        assert_eq!(nextn_present(1, 41, has), Ok(1));
-        assert_eq!(nextn_present(1, 41, |_| false), Err("no MTP draft tensors (blk.40.nextn.*): loading without the draft head, though the metadata declares nextn_predict_layers=1".into()));
-        assert_eq!(nextn_present(0, 41, has), Ok(0));
-        assert_eq!(nextn_present(41, 41, has), Ok(0));
+        assert_eq!(nextn_present(1, 41, has), (40, 1, Ok(())));
+        assert!(nextn_present(1, 41, |_| false).2.is_err(), "a head without tensors must say so");
+        assert_eq!(nextn_present(1, 41, |_| false).0, 40, "the draft layer is not a real layer");
+        assert_eq!(nextn_present(1, 41, |_| false).1, 0, "no draft head to load");
+        assert_eq!(nextn_present(0, 41, has), (41, 0, Ok(())));
+        assert_eq!(nextn_present(41, 41, has), (41, 0, Ok(())));
     }
 
     /// Without scaling the table is plain RoPE, and the first pair is exactly `base^-0 = 1`.
