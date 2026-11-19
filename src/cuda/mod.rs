@@ -62,6 +62,8 @@ pub struct Gpu {
     lag: std::sync::Mutex<Option<CudaEvent>>,
     /// rope_freq tables by (base bits, n_rot), and the ones a graph capture asked for (see `rope_fr`).
     fr: std::sync::Mutex<(HashMap<(u32, usize), CudaSlice<f64>>, Vec<(f32, usize)>)>,
+    /// `set_rope_freq` tables by n_rot: a model's own frequencies (YaRN), used instead of the computed ones.
+    fr_set: std::sync::Mutex<HashMap<usize, CudaSlice<f64>>>,
 }
 
 const RING: usize = 64 << 20;
@@ -496,7 +498,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_bits, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, kv_bits, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), fr_set: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -505,6 +507,8 @@ impl Gpu {
     /// once by the rope_freq kernel. While a graph is captured, a missing table gives 0 (the kernel computes them
     /// itself) and is made after the capture, which `graph` then repeats.
     fn rope_fr(&self, base: f32, n_rot: usize) -> anyhow::Result<u64> {
+        // A model's own table (`set_rope_freq`, YaRN) wins: the base cannot express its scaled frequencies.
+        if let Some(t) = self.fr_set.lock().unwrap().get(&n_rot) { return Ok(self.ptr(t)); }
         let mut fr = self.fr.lock().unwrap();
         if let Some(t) = fr.0.get(&(base.to_bits(), n_rot)) { return Ok(self.ptr(t)); }
         if self.stream.capture_status()? != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
@@ -816,6 +820,15 @@ impl Backend for Gpu {
     /// Forget the recorded graphs (they captured KV pointers that a reallocation replaces).
     fn clear_graphs(&self) { self.graphs.lock().unwrap().clear(); }
 
+    /// Install a model's own rope frequencies (YaRN): a device table `rms_norm_rope` and `rope_neox` then read
+    /// instead of computing `pow(base, -2i/n_rot)`.
+    fn set_rope_freq(&self, n_rot: usize, freq: &[f32]) -> anyhow::Result<()> {
+        let t = self.stream.clone_htod(&freq.iter().map(|&f| f as f64).collect::<Vec<_>>())?;
+        self.stream.synchronize()?;
+        self.fr_set.lock().unwrap().insert(n_rot, t);
+        Ok(())
+    }
+
     /// CUDA graph captured from the stream. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         if let Some(g) = self.graphs.lock().unwrap().get(&key) { return Ok(g.0.launch()?); }
@@ -949,7 +962,8 @@ impl Backend for Gpu {
     }
 
     fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()> {
-        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base, lo as i32, hi as i32);
+        let fr = self.rope_fr(base, n_rot)?;
+        launch!(self, "rope_neox", cfg(((heads / per) as u32, 1), (n_rot / 2) as u32, 0), x, stride as i32, per as i32, n_rot as i32, step, base, lo as i32, hi as i32, fr);
         Ok(())
     }
 

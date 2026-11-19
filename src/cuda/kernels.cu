@@ -1563,14 +1563,16 @@ extern "C" __global__ void l2_norm(float* x, int n, int per, int stride, float e
 }
 
 // Per-token values live in device memory so a captured graph can replay: step[0] = position, step[1] = CPU worker seq.
+__device__ __forceinline__ double rope_f(float base, int i, int n_rot);
 
 // grid = tokens (each rotates its per heads), block = n_rot / 2. NEOX pairs (i, i + n_rot/2), only lo <= i < hi (M-RoPE
 // rotates each section of pairs by its own position). Token t sits at position step[0] + t.
-extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, const int* step, float base, int lo, int hi) {
+extern "C" __global__ void rope_neox(float* x, int stride, int per, int n_rot, const int* step, float base, int lo, int hi,
+                                     const double* fr) {
     int pos = step[0] + blockIdx.x;
     int i = threadIdx.x, half = n_rot / 2;
     if (i < lo || i >= hi) return;
-    double theta = (double)pos * pow((double)base, -2.0 * i / n_rot);  // f64 is slow: once per token, not per head
+    double theta = (double)pos * (fr ? fr[i] : rope_f(base, i, n_rot));  // f64 is slow: once per token, not per head
     float s = (float)sin(theta), c = (float)cos(theta);
     for (int hd = 0; hd < per; hd++) {
         float* h = x + (size_t)(blockIdx.x * per + hd) * stride;

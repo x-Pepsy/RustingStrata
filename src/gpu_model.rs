@@ -371,11 +371,19 @@ impl<'a> GpuModel<'a> {
         let hcn = c.hc_n.max(1);
         if c.hc_n > 0 && !c.is_moe() { bail!("hyper-connections without MoE are not supported on the GPU"); }
         let (free0, _) = gpu.mem_info()?;
+        // A model with scaled rope (YaRN) brings its own frequencies: they cannot be written as a base.
+        if c.rope_yarn.is_some() {
+            gpu.set_rope_freq(c.n_rot, &c.rope_freqs).with_context(|| format!(
+                "applying the model's YaRN rope (factor {:?}, original context {})", c.rope_yarn.map(|y| y.factor), c.rope_yarn.map_or(0, |y| y.orig_ctx)))?;
+            eprintln!("rope: YaRN scaling from the model (factor {:?}, ramp {}..{}, {} pairs)", c.rope_yarn.map(|y| y.factor), c.rope_yarn.map_or(0.0, |y| y.beta_fast), c.rope_yarn.map_or(0.0, |y| y.beta_slow), c.rope_freqs.len());
+        }
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);
         let channels = c.ssm_d_inner + 2 * nk * dk;
         let kv = c.n_head_kv * c.head_dim;
         let qsa_on = c.idx_top_k > 0 && (0..c.n_layer).any(|il| m.w.layer(il, "indexer.k_proj.weight").is_ok());
         if qsa_on { ensure!(c.idx_head_dim == QSA_D && c.idx_n_head == QSA_H, "QSA indexer: {} heads of {} (the GPU kernels take {QSA_H} of {QSA_D})", c.idx_n_head, c.idx_head_dim); }
+        anyhow::ensure!(!(qsa_on && c.rope_yarn.is_some()),
+            "YaRN rope scaling with the QSA indexer is not implemented (its pooling kernel applies plain rope)");
         // The KV cache starts at `kv_start` tokens and grows on demand (`ensure_kv`). The sparse indexer pools keys
         // for the whole window, so a model with QSA keeps the full-size cache, and so does a run with several slots.
         let kv_cap = if qsa_on || ns > 1 || c.eagle3.is_some() { ctx } else { kv_start.clamp(1, ctx) };

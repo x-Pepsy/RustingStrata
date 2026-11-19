@@ -514,7 +514,7 @@ impl<'a> Model<'a> {
     fn rope(&self, x: &mut [f32], kv_pos: usize, rope_pos: [i32; 4]) {
         match self.cfg.mrope_sections {
             Some(sections) => ops::rope_mrope(x, self.cfg.n_rot, rope_pos, sections, self.cfg.rope_base),
-            None => ops::rope_neox(x, self.cfg.n_rot, kv_pos, self.cfg.rope_base),
+            None => ops::rope_neox_freq(x, self.cfg.n_rot, kv_pos, &self.cfg.rope_freqs),
         }
     }
 

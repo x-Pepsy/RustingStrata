@@ -49,6 +49,52 @@ fn arch(name: &str) -> Option<Arch> {
     })
 }
 
+/// YaRN rope scaling from the GGUF metadata (`rope.scaling.type = yarn`).
+#[derive(Clone, Copy, Debug)]
+pub struct Yarn {
+    /// Context extension: the low-frequency dimensions are compressed by this factor.
+    pub factor: f32,
+    /// The context the model was trained on before the extension (`rope.scaling.original_context_length`).
+    pub orig_ctx: usize,
+    /// The frequency boundaries of the interpolation ramp (`yarn_beta_fast`, `yarn_beta_slow`).
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+/// How many trailing layers are MTP draft layers. `nextn_predict_layers` can outlive the draft head tensors (a
+/// finetune that drops the head keeps the base model's metadata), so the declared count is kept only when the
+/// tensors of the first draft layer are there; the `Err` carries the warning to print. `block_count` includes them.
+fn nextn_present(declared: usize, block_count: usize, has: impl Fn(&str) -> bool) -> Result<usize, String> {
+    if declared == 0 || declared >= block_count { return Ok(0); }
+    let first = block_count - declared;
+    if has(&format!("blk.{first}.nextn.eh_proj.weight")) { return Ok(declared); }
+    Err(format!("no MTP draft tensors (blk.{first}.nextn.*): loading without the draft head, though the metadata \
+        declares nextn_predict_layers={declared}"))
+}
+
+/// The per-pair rope frequencies (`theta = pos * freq[i]`, `n_rot / 2` of them) for `base`, with YaRN applied when
+/// `yarn` is set: the long-wavelength pairs are interpolated towards a context `factor` times longer, with a ramp
+/// between `beta_fast` and `beta_slow` so the short wavelengths keep their resolution. Same arithmetic as
+/// llama.cpp's `rope_yarn` and `rope_yarn_corr_dims` (the attention scale factor is 1 there and here).
+pub fn rope_freqs_of(base: f32, n_rot: usize, yarn: Option<Yarn>) -> Vec<f32> {
+    let n = n_rot.max(2);
+    let plain = |i: usize| base.powf(-2.0 * i as f32 / n as f32);
+    let Some(y) = yarn.filter(|y| y.factor > 0.0 && y.orig_ctx > 0) else {
+        return (0..n / 2).map(plain).collect();
+    };
+    // The pair indices where the interpolation ramp starts and ends. Small `i` (short wavelengths) keep the
+    // original frequency, large `i` (long wavelengths) are compressed by `factor`, and the ramp blends them.
+    let cd = |rot: f32| (n as f32 * (y.orig_ctx as f32 / (rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln()))
+        .floor().max(0.0);
+    let lo = cd(y.beta_fast);
+    let hi = cd(y.beta_slow).ceil().min(n as f32 - 1.0);
+    (0..n / 2).map(|i| {
+        let extrap = plain(i);
+        let interp = extrap / y.factor;
+        let mix = 1.0 - ((i as f32 - lo) / (hi - lo).max(0.001)).clamp(0.0, 1.0);
+        interp + (extrap - interp) * mix
+    }).collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
     pub arch: String,
@@ -62,6 +108,12 @@ pub struct ModelConfig {
     /// Qwen3-VL/3.5 M-RoPE section sizes (sum = `n_rot/2`); `None` uses 1-D RoPE.
     pub mrope_sections: Option<[usize; 4]>,
     pub rope_base: f32,
+    /// YaRN rope scaling (`{arch}.rope.scaling.type = yarn`): the frequencies of the interpolated dimensions are
+    /// divided by `factor`, with the usual ramp between `beta_fast` and `beta_slow`.
+    pub rope_yarn: Option<Yarn>,
+    /// `rope_freq()` for every pair (`n_rot / 2` values), computed once at load: the kernels and the CPU path
+    /// both rotate with `theta = pos * rope_freqs[i]`.
+    pub rope_freqs: Vec<f32>,
     pub eps: f32,
     pub n_vocab: usize,
     /// Dense FFN size (0 for MoE).
@@ -120,8 +172,12 @@ impl ModelConfig {
             Ok(g.get(&key)?.as_u64().with_context(|| format!("{key}: not an integer"))? as usize)
         };
         let f = |k: &str| g.meta.get(&format!("{arch}.{k}")).and_then(|v| v.as_f32());
-        let n_nextn = opt("nextn_predict_layers");
-        let n_layer = req("block_count")? - n_nextn;
+        // A finetuned model can keep `nextn_predict_layers` from its base while dropping the draft head's tensors:
+        // trusting the metadata would then load layer `block_count - n_nextn` from tensors that are not there.
+        let block_count = req("block_count")?;
+        let n_nextn = nextn_present(opt("nextn_predict_layers"), block_count,
+            |n| g.tensors.contains_key(n)).unwrap_or_else(|n| { eprintln!("{n}"); 0 });
+        let n_layer = block_count - n_nextn;
         let layers: Vec<LayerKind> = if a.hybrid {
             let every = match opt("full_attention_interval") { 0 => 4, v => v };
             (0..n_layer).map(|il| if (il + 1) % every == 0 { LayerKind::Attn } else { LayerKind::Delta }).collect()
@@ -148,7 +204,7 @@ impl ModelConfig {
         let n_swa = opt("attention.sliding_window");
         anyhow::ensure!(!swa.contains(&true) || n_swa > 0, "sliding-window layers without attention.sliding_window");
         let emb = g.tensors.get("token_embd.weight").context("missing tensor token_embd.weight")?;
-        let c = ModelConfig {
+        let mut c = ModelConfig {
             n_layer,
             n_nextn,
             n_embd,
@@ -163,6 +219,16 @@ impl ModelConfig {
                 Some(s)
             }),
             rope_base: f("rope.freq_base").unwrap_or(10000.0),
+            rope_yarn: match g.meta.get(&format!("{arch}.rope.scaling.type")).and_then(|v| v.as_str()) {
+                Some("yarn") => Some(Yarn {
+                    factor: f("rope.scaling.factor").unwrap_or(1.0),
+                    orig_ctx: opt("rope.scaling.original_context_length"),
+                    beta_fast: f("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+                    beta_slow: f("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+                }),
+                Some(t) => bail!("rope scaling '{t}' is not supported (only yarn)"),
+                None => None,
+            },
             eps: f("attention.layer_norm_rms_epsilon").context("missing rms epsilon")?,
             n_vocab: emb.dims[1] as usize,
             n_ff: opt("feed_forward_length"),
@@ -194,17 +260,73 @@ impl ModelConfig {
             aliases: a.aliases,
             arch,
             eagle3: None,
+            rope_freqs: vec![],
         };
         // Kernels divide by these and index value heads by nv / nk key heads.
         let (nk, nv) = (c.ssm_n_group, c.ssm_dt_rank);
         anyhow::ensure!(!has_delta || (nk > 0 && nv > 0 && nv % nk == 0 && c.ssm_d_inner % nv == 0),
             "bad ssm dims: group_count {nk}, time_step_rank {nv}, inner_size {}", c.ssm_d_inner);
+        c.rope_freqs = c.rope_freq();
+        anyhow::ensure!(c.rope_yarn.is_none() || c.mrope_sections.is_none(),
+            "YaRN rope scaling is not implemented together with M-RoPE");
         Ok(c)
     }
+
+    /// The per-pair rope frequencies: `theta = pos * rope_freq()[i]` for pair `i` of `n_rot / 2`. Plain RoPE is
+    /// `base^(-2i/n_rot)`; with YaRN the low-frequency (long-wavelength) pairs are interpolated towards the
+    /// frequencies of a context `factor` times longer, with a ramp between `beta_fast` and `beta_slow` so the short
+    /// wavelengths keep their resolution. Same arithmetic as llama.cpp's `rope_yarn`.
+    pub fn rope_freq(&self) -> Vec<f32> { rope_freqs_of(self.rope_base, self.n_rot, self.rope_yarn) }
 
     pub fn is_moe(&self) -> bool { self.n_expert > 0 }
     /// Layer `il` uses the MoE FFN (dense-lead architectures start with `n_dense` dense layers).
     pub fn is_moe_layer(&self, il: usize) -> bool { self.n_expert > 0 && il >= self.n_dense }
     /// DeltaNet value head size (0 without DeltaNet layers).
     pub fn ssm_dv(&self) -> usize { self.ssm_d_inner / self.ssm_dt_rank.max(1) }
+}
+
+#[cfg(test)]
+mod rope_freq_tests {
+    use super::*;
+
+    /// The draft head's metadata is trusted only when its tensors are there.
+    #[test]
+    fn a_missing_draft_head_is_not_loaded() {
+        let has = |n: &str| n == "blk.40.nextn.eh_proj.weight";
+        assert_eq!(nextn_present(1, 41, has), Ok(1));
+        assert_eq!(nextn_present(1, 41, |_| false), Err("no MTP draft tensors (blk.40.nextn.*): loading without the draft head, though the metadata declares nextn_predict_layers=1".into()));
+        assert_eq!(nextn_present(0, 41, has), Ok(0));
+        assert_eq!(nextn_present(41, 41, has), Ok(0));
+    }
+
+    /// Without scaling the table is plain RoPE, and the first pair is exactly `base^-0 = 1`.
+    #[test]
+    fn plain_matches_the_base() {
+        let f = rope_freqs_of(1e7, 64, None);
+        assert_eq!(f.len(), 32);
+        assert!((f[0] - 1.0).abs() < 1e-6);
+        let want = 1e7f64.powf(-2.0 / 64.0);
+        assert!((f[1] as f64 - want).abs() < 1e-6 * want);
+    }
+
+    /// YaRN leaves the short wavelengths alone, divides the long ones by the factor, and never goes up.
+    #[test]
+    fn yarn_interpolates_the_long_wavelengths() {
+        let y = Yarn { factor: 4.0, orig_ctx: 262144, beta_fast: 32.0, beta_slow: 1.0 };
+        let plain = rope_freqs_of(1e7, 64, None);
+        let yarn = rope_freqs_of(1e7, 64, Some(y));
+        assert!((yarn[0] - plain[0]).abs() < 1e-9, "pair 0: {} vs {}", yarn[0], plain[0]);
+        let (last, p) = (yarn[31], plain[31]);
+        assert!((last as f64 / p as f64 - 0.25).abs() < 0.01, "pair 31: {last} vs {p}");
+        assert!(yarn.windows(2).all(|w| w[0] > w[1]), "frequencies must fall with the pair index");
+    }
+
+    /// A factor of 1 changes nothing, however the ramp is shaped.
+    #[test]
+    fn factor_one_is_the_identity() {
+        let y = Yarn { factor: 1.0, orig_ctx: 131072, beta_fast: 32.0, beta_slow: 1.0 };
+        let plain = rope_freqs_of(1e7, 64, None);
+        let scaled = rope_freqs_of(1e7, 64, Some(y));
+        for (a, b) in plain.iter().zip(&scaled) { assert!((a - b).abs() < 1e-9); }
+    }
 }

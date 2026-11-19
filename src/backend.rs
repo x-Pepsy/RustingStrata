@@ -102,6 +102,11 @@ pub trait Backend: Send {
     /// Forget the recorded graphs: their captured pointers are stale once a buffer they read (the KV cache) is
     /// reallocated. Runs on the next `graph` call record again.
     fn clear_graphs(&self) {}
+    /// Use `freq[i]` (pair `i` of `n_rot / 2`) as the rope frequency instead of `base^(-2i/n_rot)`: that is how a
+    /// model's YaRN scaling reaches the kernels. Backends without it must refuse rather than rotate wrongly.
+    fn set_rope_freq(&self, _n_rot: usize, _freq: &[f32]) -> anyhow::Result<()> {
+        anyhow::bail!("this backend cannot apply a scaled rope (YaRN)")
+    }
     /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
     /// barriers between them); ops after the batch see all their results.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }

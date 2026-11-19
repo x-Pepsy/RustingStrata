@@ -44,6 +44,19 @@ pub fn rope_neox(x: &mut [f32], n_rot: usize, pos: usize, base: f32) {
     }
 }
 
+/// `rope_neox` with the per-pair frequencies already worked out (`ModelConfig::rope_freqs`), so a scaled rope
+/// (YaRN) needs no special case here: pair `i` rotates by `pos * freq[i]`.
+pub fn rope_neox_freq(x: &mut [f32], n_rot: usize, pos: usize, freq: &[f32]) {
+    let half = n_rot / 2;
+    for i in 0..half {
+        let theta = pos as f64 * freq[i] as f64;
+        let (s, c) = (theta.sin() as f32, theta.cos() as f32);
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * c - b * s;
+        x[i + half] = a * s + b * c;
+    }
+}
+
 /// LayerNorm over one row (`ggml_norm`, not RMS): mean/variance over all features, then `w`/`b`.
 pub fn layer_norm(x: &[f32], w: &[f32], b: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
