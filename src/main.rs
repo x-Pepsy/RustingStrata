@@ -115,9 +115,10 @@ struct Engine {
     /// Let the model think before answering (chat and `serve`); `--think false` turns it off. A request's `chat_template_kwargs.enable_thinking` overrides it in `serve`.
     #[arg(long = "think", default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     think_default: bool,
-    /// KV cache format (GPU): f16, or q8 (q8_0 blocks, half the KV memory; numerics differ slightly from
-    /// llama.cpp's default f16 cache).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+    /// KV cache format (GPU): f16, q8, q4 or q2. q4 halves the cache against q8 and costs nothing measurable; q2
+    /// quarters it but its decode is ~25% slower on this kernel, so it only pays on a card where the freed VRAM
+    /// buys enough experts to cover that.
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
     kv: String,
     /// GPU backend: cuda or vulkan [default: cuda if it loads, else vulkan].
     #[arg(long)]
@@ -323,7 +324,7 @@ impl Engine {
             }
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        if self.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+        set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
         let open = || self.device.iter().map(|&d| backend::open(self.backend.as_deref(), d)).collect::<anyhow::Result<Vec<_>>>();
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { eprintln!("no GPU backend ({e:#}), running on the CPU"); None }
@@ -419,6 +420,17 @@ impl Engine {
 
 /// Per-device VRAM margins in MB from `--vram-margin`: one value for every device, one per device like `512,256`,
 /// or one per GPU index like `0:512,1:256`. The result is in the order of `devices`.
+/// Tells the backends which KV format to build for (`--kv`): the GPU opens its kernels once, so the choice travels
+/// through the environment rather than through every call.
+fn set_kv_env(kv: &str) {
+    match kv.strip_prefix('q') {
+        Some("8") => unsafe { std::env::set_var("STRATA_KV_BITS", "8") },
+        Some("4") => unsafe { std::env::set_var("STRATA_KV_BITS", "4") },
+        Some("2") => unsafe { std::env::set_var("STRATA_KV_BITS", "2") },
+        _ => unsafe { std::env::remove_var("STRATA_KV_BITS") },
+    }
+}
+
 fn vram_margins(spec: &[String], devices: &[usize]) -> anyhow::Result<Vec<usize>> {
     let parse = |s: &str| -> anyhow::Result<(Option<usize>, usize)> {
         let (idx, mb) = match s.split_once(':') {
@@ -802,8 +814,8 @@ enum Cmd {
         /// Accepted for consistency with the other commands; calibration always uses the base model.
         #[arg(long, value_name = "PATH:SCALE", action = clap::ArgAction::Append)]
         lora: Vec<String>,
-        /// KV cache format to calibrate with (q8 leaves more VRAM for experts), as `--kv` of the runs that use it.
-        #[arg(long, default_value = "f16", value_parser = ["f16", "q8"])]
+        /// KV cache format to calibrate with (q8/q4 leave more VRAM for experts), as `--kv` of the runs that use it.
+        #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
         kv: String,
         /// Accepted for symmetry with the other commands: calibration always runs on the GPU.
         #[arg(long, hide = true)]
@@ -1116,7 +1128,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, kv, lora, gpu: _ } => {
-            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }  // read by Gpu::new and Vk::new
+            set_kv_env(&kv);  // read by Gpu::new and Vk::new
             if !lora.is_empty() { eprintln!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             let margins = vram_margins(&vram_margin, &device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
             calibrate(&model, ctx, &margins, backend.as_deref(), &device)?
@@ -1439,13 +1451,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if !o.is_null() {
                     engine = engine.with(&o)?;
                     // `runner` only sets it.
-                    if engine.kv != "q8" { unsafe { std::env::remove_var("STRATA_KV_Q8") } }
+                    set_kv_env(&engine.kv)
                 }
                 // The page's calibrate button: measure with no model loaded, then load with the measured chunk and MTP
                 // (they replace `--chunk`/`--mtp` and the page's earlier values).
                 let cal = if o["calibrate"] == true && engine.gpu {
                     (engine.chunk, engine.mtp) = (None, None);
-                    if engine.kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") } }
+                    set_kv_env(&engine.kv);
                     s.stats.lock().unwrap().unload(p.file_stem().and_then(|n| n.to_str()).map(String::from));
                     vram_margins(&engine.vram_margin, &engine.device)
                         .and_then(|mb| calibrate(&p, engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device))
