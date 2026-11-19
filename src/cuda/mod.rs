@@ -813,6 +813,9 @@ impl Backend for Gpu {
         Ok(self.stream.join(&self.side)?)
     }
 
+    /// Forget the recorded graphs (they captured KV pointers that a reallocation replaces).
+    fn clear_graphs(&self) { self.graphs.lock().unwrap().clear(); }
+
     /// CUDA graph captured from the stream. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         if let Some(g) = self.graphs.lock().unwrap().get(&key) { return Ok(g.0.launch()?); }
@@ -1200,16 +1203,16 @@ mod tests {
                 return;
             }
         }
-        let src = super::source(false, true);
+        let src = super::source(0, true);
         super::nvrtc::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
         super::nvrtc::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
         // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
-        super::nvrtc::cubin(&super::source(false, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
+        super::nvrtc::cubin(&super::source(0, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
         // M2-T3 candidates C2 (`__launch_bounds__(·, 2)`) and C3 (`GEMM_BK = 32`) must compile before the window.
-        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
+        let c23 = super::source_with(0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         super::nvrtc::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
         // M2-T5 load-width candidate: one 16-byte Q4_K header load in the GEMV path must compile for both arches.
-        let lw = super::source_with(false, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        let lw = super::source_with(0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
         super::nvrtc::cubin(&lw, "sm_70").expect("the GEMV_LOADW candidate must compile for sm_70");
         super::nvrtc::cubin(&lw, "sm_80").expect("the GEMV_LOADW candidate must compile for sm_80");
     }
@@ -1218,7 +1221,7 @@ mod tests {
     #[test]
     fn nvrtc_compiles_full_source_for_sm75() {
         if !super::nvrtc::present() { return; }
-        super::nvrtc::cubin(&super::source(false, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(0, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
         super::nvrtc::cubin(&super::source(8, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
     }
 
@@ -1393,17 +1396,17 @@ mod tests {
     /// kernel; the C2/C3 window candidates only change the injected values.
     #[test]
     fn source_injects_tiles() {
-        let src = super::source_with(false, true, super::Tune::def());
+        let src = super::source_with(0, true, super::Tune::def());
         for define in [
             "#define GEMM_BM 128", "#define GEMM_BK 64", "#define GEMM_MIN_BLOCKS 1", "#define GEMV_LOADW 0",
             "#define FA_BQ 64", "#define FA_BK 32",
         ] {
             assert!(src.contains(define), "source is missing `{define}`");
         }
-        let c23 = super::source_with(false, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
+        let c23 = super::source_with(0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         assert!(c23.contains("#define GEMM_BK 32"));
         assert!(c23.contains("#define GEMM_MIN_BLOCKS 2"));
-        let lw = super::source_with(false, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        let lw = super::source_with(0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
         assert!(lw.contains("#define GEMV_LOADW 1"));
     }
 

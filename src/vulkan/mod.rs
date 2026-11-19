@@ -1150,6 +1150,9 @@ impl Backend for Vk {
         st.tlag = 0;
         Ok(())
     }
+    /// Forget the recorded command buffers (they captured KV pointers that a reallocation replaces).
+    fn clear_graphs(&self) { self.0.st().graphs.clear(); }
+
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
         if let Some(&g) = st.graphs.get(&key) { return self.0.enqueue_cb(&mut st, Some(g)); }
@@ -1167,8 +1170,7 @@ impl Backend for Vk {
         self.0.end_cond(&mut st, c);
         unsafe { self.0.dev.end_command_buffer(c) }?;
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
-        st.graphs.insert(key, c);
-        self.0.enqueue_cb(&mut st, Some(c))
+        st.graphs.insert(key, c);        self.0.enqueue_cb(&mut st, Some(c))
     }
 
     fn moe_mailbox_optional(&self) -> bool { true }

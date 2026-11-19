@@ -338,6 +338,8 @@ pub struct Stats {
     pub ctx_train: Option<u64>,
     /// Requests decoded at once (`--parallel`).
     pub slots: usize,
+    /// Tokens of KV cache allocated now: it starts at `--ctx-start` and grows towards `ctx` on demand.
+    pub kv_cap: usize,
     /// Device memory in use and in total, measured after the load and after each request.
     pub vram: Option<(u64, u64)>,
     /// Host RAM cap in bytes (`total - --ram-margin`, or `--max-ram`); `None` if undetectable.

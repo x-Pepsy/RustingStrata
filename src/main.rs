@@ -27,6 +27,10 @@ struct Engine {
     /// GPU context length (KV cache size) in tokens.
     #[arg(long, default_value_t = 4096)]
     ctx: usize,
+    /// KV cache allocated at load, in tokens; it grows towards `--ctx` only when a conversation needs it, so the
+    /// VRAM stays with the expert slots until then (0 = allocate `--ctx` from the start).
+    #[arg(long, default_value_t = 0)]
+    ctx_start: usize,
     /// Prefill chunk in tokens (GPU; 0 = token by token) [default: calibrated, else 4096].
     #[arg(long)]
     chunk: Option<usize>,
@@ -374,9 +378,9 @@ impl Engine {
         let margins = vram_margins(&self.vram_margin, &self.device)?.into_iter().map(|mb| mb << 20).collect::<Vec<_>>();
         let spec_k = if mtp > 0 { mtp } else if ngram_cfg.is_enabled() && self.parallel <= 1 { ngram_cfg.draft_max } else { 0 };
         let mut g = if self.parallel > 1 {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, 0, self.parallel).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, 0, self.parallel, self.kv_start()).context(LOAD_HINT)?
         } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, spec_k, 1).context(LOAD_HINT)?
+            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, spec_k, 1, self.kv_start()).context(LOAD_HINT)?
         };
         if ngram_cfg.is_enabled() && self.parallel <= 1 {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
@@ -416,6 +420,8 @@ impl Engine {
     }
     fn chunk(&self) -> usize { self.chunk.unwrap_or(4096) }
     fn mtp(&self) -> usize { self.mtp.unwrap_or(0) }
+    /// KV tokens to allocate at load: `--ctx-start`, or all of `--ctx` when it is 0.
+    fn kv_start(&self) -> usize { if self.ctx_start == 0 { self.ctx } else { self.ctx_start.min(self.ctx).max(1) } }
 }
 
 /// Per-device VRAM margins in MB from `--vram-margin`: one value for every device, one per device like `512,256`,
@@ -1642,7 +1648,7 @@ fn calibrate(model: &Path, ctx: usize, margin: &[usize], kind: Option<&str>, dev
     let pf = prose(&tok, n_pf)?;
     let load = |chunk: usize| -> anyhow::Result<GpuModel> {
         let bk = device.iter().map(|&d| backend::open(kind, d)).collect::<anyhow::Result<Vec<_>>>()?;
-        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, 3, 1).context(LOAD_HINT)?;
+        let mut gm = GpuModel::load_split_margins(&m, bk, ctx, chunk, margin, 3, 1, ctx).context(LOAD_HINT)?;
         gm.adapt_every = 0; // fixed placement: steadier timings
         Ok(gm)
     };
@@ -2152,6 +2158,7 @@ fn gpu_model_stats(g: &GpuModel, s: &mut serve::Stats) {
     s.vram = g.gpu.mem_info().ok().map(|(f, t)| ((t - f) as u64, t as u64));
     s.experts = g.cache.as_ref().map(|_| (g.hits as u64, g.misses as u64));
     s.drafts = (g.drafts.0 > 0).then_some((g.drafts.0 as u64, g.drafts.1 as u64));
+    s.kv_cap = g.kv_cap;
 }
 
 /// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
